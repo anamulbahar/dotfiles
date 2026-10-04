@@ -1,0 +1,35 @@
+# --- dot safety net: never commit secrets (kept by dot; add your rules below) ---
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+.netrc
+.git-credentials
+*credential*
+*secret*
+*token*
+.env
+.env.*
+rclone.conf
+hosts.yml*
+known_hosts*
+authorized_keys
+*.sqlite*
+*.db
+*.db-*
+*history*
+.DS_Store
+._*
+*.icloud
+*.local
+*.swp
+.dot-tmp.*
+# --- end dot safety net ---
+
+# local tool worktrees
+.claude/

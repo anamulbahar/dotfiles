@@ -1,0 +1,44 @@
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -s sh dot tests/run.sh
+
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [sh, dash, bash, zsh, ksh, mksh, yash, "busybox sh"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dash zsh ksh busybox mksh yash age
+      - run: sh tests/run.sh "${{ matrix.shell }}"
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [sh, dash, bash, zsh, ksh]
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install age
+      - run: sh tests/run.sh "${{ matrix.shell }}"
+
+  alpine:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - run: apk add --no-cache git openssl age
+      - uses: actions/checkout@v4
+      - run: sh tests/run.sh sh

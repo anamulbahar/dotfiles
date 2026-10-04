@@ -1,0 +1,4 @@
+# Plugins re-cloned by "dot apply" instead of being copied.
+# Written by "dot capture".
+# Format: <path in ~/.config> <git url> <branch|tag|commit>
+vim/pack/github/start/copilot.vim https://github.com/github/copilot.vim.git release

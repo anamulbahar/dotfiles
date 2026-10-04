@@ -1,0 +1,449 @@
+#!/usr/bin/env sh
+
+# shell prompt (cyan colored current folder followed by a colon)
+# Only set PS1 in interactive shells
+if [ -n "$PS1" ]; then
+    case "$0" in
+        *bash*) PS1='\[\e[36m\]\W\[\e[m\]: ' ;;
+        *zsh*) PS1='%F{cyan}%c%f: ' ;;
+    esac
+fi
+
+export EDITOR="vim"
+export VISUAL="vim"
+export LANG=en_US.UTF-8
+export LSCOLORS=GxfxcxfxCxegedabagacad
+LS_COLORS='di=1;36:ln=35:so=32:pi=35:ex=1;32'
+LS_COLORS="${LS_COLORS}:bd=34;46:cd=34;43:su=30;41"
+LS_COLORS="${LS_COLORS}:sg=30;46:tw=30;42:ow=30;43"
+export LS_COLORS
+color_prompt=yes
+
+export LESSHISTFILE=/dev/null
+export LESSHISTSIZE=0
+
+# aliases for interactive shells
+if [ -n "$PS1" ]; then
+    # aliases for Linux
+    if [ "$(uname)" = "Linux" ]; then
+        alias ls='ls --color=auto'
+        alias ll='ls -alF'
+        alias la='ls -A'
+        alias l='ls -CF'
+        alias grep='grep --color=auto'
+        alias fgrep='fgrep --color=auto'
+        alias egrep='egrep --color=auto'
+    fi
+
+    # aliases for macOS
+    if [ "$(uname)" = "Darwin" ]; then
+        alias ls='ls -GF'
+        alias ll='ls -alF'
+        alias la='ls -aF'
+        alias l='ls -CF'
+        alias netoff="networksetup -setairportpower en0 off"
+        alias neton="networksetup -setairportpower en0 on"
+        alias sleepoff="sudo pmset -a disablesleep 1"
+        alias sleepon="sudo pmset -a disablesleep 0"
+        alias autobootoff="sudo nvram AutoBoot=%00"
+        alias autobooton="sudo nvram AutoBoot=%03"
+    fi
+fi
+
+# Add a folder to PATH once, and only if it exists, so this rc is safe to
+# load on any machine and on top of any existing setup (Linux keeps its
+# /snap/bin and friends). Usage: _path_add <folder> [front]
+_path_add() {
+    [ -d "$1" ] || return 0
+    case ":$PATH:" in *":$1:"*) return 0 ;; esac
+    if [ "${2:-}" = front ]; then
+        PATH="$1${PATH:+:$PATH}"
+    else
+        PATH="${PATH:+$PATH:}$1"
+    fi
+}
+
+# System and local paths
+for _p in /usr/bin /bin /usr/sbin /sbin /usr/local/bin /usr/local/sbin; do
+    _path_add "$_p"
+done
+
+# Homebrew path (macOS, then Linux)
+_path_add /opt/homebrew/bin front
+_path_add /home/linuxbrew/.linuxbrew/bin front
+
+# User-managed package tools
+_path_add "$HOME/.local/bin"
+_path_add "$HOME/.pixi/bin"
+
+# Personal scripts
+_path_add "$HOME/Documents/Binary"
+unset _p
+export PATH
+
+copilot_setup() {
+    dir="$HOME/.vim/pack/github/start/copilot.vim"
+
+    if [ -d "$dir/.git" ]; then
+        git -C "$dir" pull --ff-only || return 1
+    elif [ -e "$dir" ]; then
+        echo "Refusing to replace non-Git path: $dir"
+        return 1
+    else
+        mkdir -p "$(dirname "$dir")" || return 1
+        git clone https://github.com/github/copilot.vim.git "$dir" || return 1
+    fi
+
+    vim -c "Copilot setup" -c "qa"
+}
+
+brew_install() {
+    if [ ! -f /usr/local/bin/brew ] && [ ! -f /opt/homebrew/bin/brew ]; then
+    /bin/bash -c "$(curl -fsSL \
+    https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    else
+        echo "Homebrew is already installed."
+    fi
+}
+
+brew_uninstall() {
+    if [ -f /usr/local/bin/brew ] || [ -f /opt/homebrew/bin/brew ]; then
+    /bin/bash -c "$(curl -fsSL \
+    https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh)"
+    else
+        echo "Homebrew is not installed."
+    fi
+}
+
+pixi_install() {
+    if command -v pixi >/dev/null 2>&1; then
+        echo "Pixi is already installed: $(command -v pixi)"
+        pixi --version
+        return 0
+    fi
+
+    if ! curl -fsSL https://pixi.sh/install.sh | sh; then
+        echo "Pixi installation failed."
+        return 1
+    fi
+
+    echo "Pixi installed. Open a new shell or run:"
+    echo "export PATH=\"\$HOME/.pixi/bin:\$PATH\""
+}
+
+xcode_install() {
+    if [ "$(uname)" != "Darwin" ]; then
+        echo "Xcode Command Line Tools are only for macOS."
+        return 1
+    fi
+
+    if xcode-select -p >/dev/null 2>&1; then
+        echo "Xcode Command Line Tools are already installed:" \
+            "$(xcode-select -p)"
+        return 0
+    fi
+
+    xcode-select --install
+    echo "Finish the installation in the window that opened."
+}
+
+# Download an official installer to a temporary file, then run it with the
+# shell it was written for. Downloading first means a failed or partial
+# download never runs (POSIX sh has no pipefail to catch "curl | sh").
+# Usage: _curl_install <name> <command> <url> <sh|bash>
+_curl_install() {
+    if command -v "$2" >/dev/null 2>&1; then
+        echo "$1 is already installed: $(command -v "$2")"
+        return 0
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "curl is required to install $1."
+        return 1
+    fi
+
+    if ! command -v "$4" >/dev/null 2>&1; then
+        echo "The $1 installer needs $4." \
+            "Install $4 first (Alpine: apk add $4)."
+        return 1
+    fi
+
+    _ci_tmp=$(mktemp "${TMPDIR:-/tmp}/install.XXXXXX") || return 1
+
+    if ! curl -fsSL "$3" -o "$_ci_tmp"; then
+        echo "Could not download the $1 installer: $3"
+        rm -f "$_ci_tmp"
+        unset _ci_tmp
+        return 1
+    fi
+
+    if ! "$4" "$_ci_tmp"; then
+        echo "$1 installation failed."
+        rm -f "$_ci_tmp"
+        unset _ci_tmp
+        return 1
+    fi
+
+    rm -f "$_ci_tmp"
+    unset _ci_tmp
+    echo "$1 installed. Open a new shell if '$2' is not found yet."
+}
+
+claude_install() {
+    _curl_install "Claude Code" claude https://claude.ai/install.sh bash
+}
+
+codex_install() {
+    _curl_install "Codex CLI" codex https://chatgpt.com/codex/install.sh sh
+}
+
+antigravity_install() {
+    _curl_install "Antigravity CLI" agy \
+        https://antigravity.google/cli/install.sh bash
+}
+
+copilot_install() {
+    _curl_install "GitHub Copilot CLI" copilot \
+        https://gh.io/copilot-install bash
+}
+
+ai_install() {
+    _ai_failed=""
+    claude_install || _ai_failed="$_ai_failed claude"
+    codex_install || _ai_failed="$_ai_failed codex"
+    antigravity_install || _ai_failed="$_ai_failed antigravity"
+    copilot_install || _ai_failed="$_ai_failed copilot"
+
+    if [ -n "$_ai_failed" ]; then
+        echo "Not installed:$_ai_failed"
+        unset _ai_failed
+        return 1
+    fi
+    unset _ai_failed
+}
+
+rlsf() {
+    rclone lsf "$1"
+}
+
+rlsf_all() {
+    for i in $(rclone listremotes); do
+        printf "\n"
+        printf "rclone lsf %s\n" "$i"
+        rclone lsf "${i}"
+    done
+}
+
+# Run "rclone <copy|sync> SOURCE DESTINATION" in tmux or screen when available.
+# The positional parameters hold the command, so no arrays are needed.
+# Usage: _rclone_bg <session-name> <copy|sync> SOURCE DESTINATION
+_rclone_bg() {
+    _rb_session="$1-$(date +%Y%m%d-%H%M%S)"
+    shift
+    set -- rclone "$1" --exclude '{.DS_Store,.localized}' \
+        --progress --update "$2" "$3"
+
+    if command -v tmux >/dev/null 2>&1 &&
+        tmux new-session -d -s "$_rb_session" -- "$@" 2>/dev/null; then
+        echo "Started in tmux: $_rb_session"
+        echo "Attach with: tmux attach -t $_rb_session"
+    elif command -v screen >/dev/null 2>&1 &&
+        screen -dmS "$_rb_session" "$@" 2>/dev/null; then
+        echo "Started in screen: $_rb_session"
+        echo "Attach with: screen -r $_rb_session"
+    else
+        echo "tmux and screen unavailable; running directly."
+        "$@"
+    fi
+    unset _rb_session
+}
+
+rcopy() {
+    if [ "$#" -ne 2 ]; then
+        echo "Usage: rcopy SOURCE DESTINATION"
+        return 2
+    fi
+    _rclone_bg rcopy copy "$1" "$2"
+}
+
+rcsync() {
+    if [ "$#" -ne 2 ]; then
+        echo "Usage: rcsync SOURCE DESTINATION"
+        return 2
+    fi
+    _rclone_bg rcsync sync "$1" "$2"
+}
+
+rmount() {
+    if [ "$#" -ne 1 ]; then
+        echo "Usage: rmount <remote-name[:]>"
+        return 2
+    fi
+
+    case "$1" in
+        "") echo "Usage: rmount <remote-name[:]>"; return 2 ;;
+        *:) name="${1%:}" ;;       # Strip trailing colon
+        *) name="$1" ;;
+    esac
+
+    case "$name" in
+        ""|"."|".."|*/*)
+            echo "Invalid remote name: $name"
+            echo "Usage: rmount <remote-name[:]>"
+            return 2
+            ;;
+    esac
+
+    dir="$HOME/$name"
+    if ! mkdir -p "$dir"; then
+        echo "Could not create mount point: $dir"
+        return 1
+    fi
+
+    if ! rclone nfsmount --daemon --vfs-cache-mode full "$name:" "$dir"; then
+        echo "Failed to mount $name"
+        return 1
+    fi
+}
+
+runmount() {
+    if [ "$#" -ne 1 ]; then
+        echo "Usage: runmount <remote-name[:]>"
+        return 2
+    fi
+
+    case "$1" in
+        "") echo "Usage: runmount <remote-name[:]>"; return 2 ;;
+        *:) name="${1%:}" ;;
+        *) name="$1" ;;
+    esac
+
+    case "$name" in
+        ""|"."|".."|*/*)
+            echo "Invalid remote name: $name"
+            echo "Usage: runmount <remote-name[:]>"
+            return 2
+            ;;
+    esac
+
+    dir="$HOME/$name"
+    if [ ! -d "$dir" ]; then
+        echo "Mount point does not exist: $dir"
+        return 1
+    fi
+
+    case "$(uname)" in
+        Darwin)
+            if ! diskutil unmount "$dir" 2>/dev/null && \
+                ! umount "$dir"; then
+                echo "Could not unmount: $dir"
+                return 1
+            fi
+            ;;
+        Linux)
+            if ! fusermount -u "$dir"; then
+                echo "Could not unmount: $dir"
+                return 1
+            fi
+            ;;
+        *)
+            echo "Unsupported operating system: $(uname)"
+            return 1
+            ;;
+    esac
+
+    if ! rmdir "$dir" 2>/dev/null; then
+        echo "Unmounted, but mount directory was not empty: $dir"
+        return 1
+    fi
+}
+
+# Update the system packages of any Linux family with its own package manager.
+_system_update() {
+    _su=""
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            _su="sudo"
+        elif command -v doas >/dev/null 2>&1; then
+            _su="doas"
+        else
+            echo "Skipping system packages: run as root or install sudo."
+            unset _su
+            return 1
+        fi
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        printf '\nUpdating system packages (apt)...\n'
+        $_su apt-get update && $_su apt-get -y upgrade &&
+            $_su apt-get -y autoremove
+    elif command -v dnf >/dev/null 2>&1; then
+        printf '\nUpdating system packages (dnf)...\n'
+        $_su dnf -y upgrade --refresh
+    elif command -v yum >/dev/null 2>&1; then
+        printf '\nUpdating system packages (yum)...\n'
+        $_su yum -y update
+    elif command -v zypper >/dev/null 2>&1; then
+        printf '\nUpdating system packages (zypper)...\n'
+        $_su zypper --non-interactive refresh &&
+            $_su zypper --non-interactive update
+    elif command -v pacman >/dev/null 2>&1; then
+        printf '\nUpdating system packages (pacman)...\n'
+        $_su pacman -Syu --noconfirm
+    elif command -v apk >/dev/null 2>&1; then
+        printf '\nUpdating system packages (apk)...\n'
+        $_su apk update && $_su apk upgrade
+    else
+        echo "No supported system package manager found."
+        unset _su
+        return 1
+    fi
+    set -- "$?"
+    unset _su
+    return "$1"
+}
+
+# One command updates everything: pixi everywhere, then Homebrew on macOS or
+# the system packages on Linux.
+update() {
+    if command -v pixi >/dev/null 2>&1; then
+        printf '\nUpdating Pixi packages...\n'
+        pixi self-update && pixi g update
+        printf '\nPixi packages installed:\n'
+        pixi g ls
+    else
+        echo "Pixi is not installed (run pixi_install)."
+    fi
+
+    case "$(uname)" in
+        Darwin)
+            if command -v brew >/dev/null 2>&1; then
+                printf '\nUpdating Homebrew packages...\n'
+                brew upgrade --greedy && brew cleanup --prune=all
+                printf '\nHomebrew packages installed:\n'
+                brew list --versions
+            else
+                echo "Homebrew is not installed (run brew_install)."
+            fi
+            ;;
+        Linux)
+            _system_update
+            ;;
+    esac
+}
+
+# Backward-compatible aliases for hyphenated helper names
+if [ -n "$PS1" ]; then
+    alias copilot-setup='copilot_setup'
+    alias brew-install='brew_install'
+    alias brew-uninstall='brew_uninstall'
+    alias pixi-install='pixi_install'
+    alias xcode-install='xcode_install'
+    alias claude-install='claude_install'
+    alias codex-install='codex_install'
+    alias antigravity-install='antigravity_install'
+    alias copilot-install='copilot_install'
+    alias ai-install='ai_install'
+    alias rlsf-all='rlsf_all'
+fi
+

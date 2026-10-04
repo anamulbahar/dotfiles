@@ -1,0 +1,10 @@
+# Home-folder files made by "dot apply" and "dot link".
+#   <path under ~>  <path under ~/.config>  [source] [os=|host=]
+# Default: ~/<path> becomes a symlink. A target ending in / is a
+# folder, created (mode 700) if missing. "source": an existing
+# file is kept and gets one line that loads the target; a missing
+# one becomes a symlink (used for ~/.zshrc and ~/.bashrc).
+.ssh                 ssh/
+.vim                 vim/
+.zshrc               sh/rc        source
+.bashrc              sh/rc        source

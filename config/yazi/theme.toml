@@ -1,0 +1,50 @@
+[app]
+overall = { bg = "#080c10" }
+
+[mgr]
+cwd          = { fg = "#22d3ee", bold = true }
+border_style = { fg = "#155e75" }
+
+[indicator]
+parent  = { fg = "#22d3ee" }
+current = { fg = "#ecfeff", bg = "#164e63", bold = true, reversed = false }
+preview = { fg = "#0891b2" }
+padding = { open = " ", close = " " }
+
+[status]
+sep_left  = { open = "",  close = " " }
+sep_right = { open = " ", close = "" }
+
+[tabs]
+active   = { fg = "#080c10", bg = "#22d3ee", bold = true }
+inactive = { fg = "#67e8f9", bg = "#0f1720" }
+sep_inner = { open = "[", close = "]" }
+sep_outer = { open = "[", close = "]" }
+
+[mode]
+normal_main = { fg = "#080c10", bg = "#22d3ee", bold = true }
+normal_alt  = { fg = "#22d3ee", bg = "#0f1720" }
+
+[filetype]
+rules = [
+  { url = "**/.{zshrc,zprofile,zlogin,zlogout,bashrc,bash_profile,profile}", fg = "#facc15" },
+  { url = "*.{sh,zsh,bash,fish}", fg = "#facc15" },
+  { url = "*.{toml,yaml,yml,json,xml,ini,conf,cfg}", fg = "#fbbf24" },
+  { url = "*.{py,rs,go,c,cc,cpp,h,hpp,js,jsx,ts,tsx,swift,java,rb,lua}", fg = "#a78bfa" },
+  { mime = "image/*", fg = "#c084fc" },
+  { mime = "{audio,video}/*", fg = "#f472b6" },
+  { mime = "application/{zip,rar,7z*,tar,gzip,xz,zstd,bzip*,lzma,compress,archive,cpio,arj,xar,ms-cab*}", fg = "#f87171" },
+  { mime = "application/{pdf,doc,rtf,msword,vnd.openxmlformats-officedocument.*}", fg = "#60a5fa" },
+  { url = "*", is = "orphan", fg = "#f87171", bold = true },
+  { url = "*", is = "link", fg = "#22d3ee", italic = true },
+  { url = "*", is = "exec", fg = "#4ade80" },
+  { url = "*", fg = "#f8fafc" },
+  { url = "*/", fg = "#67e8f9", bold = true },
+]
+
+[icon]
+globs = []
+dirs  = []
+files = []
+exts  = []
+conds = []

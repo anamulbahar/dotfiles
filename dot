@@ -1,0 +1,3402 @@
+#!/bin/sh
+# dot - back up, restore and sync ~/.config with git, without the secrets.
+#
+# One POSIX sh file. Runs on dash, ash/busybox, bash, ksh and zsh, on macOS
+# and Linux (GNU or busybox userland). Needs only standard POSIX utilities;
+# git for history and sync, gh (optional) for one-step GitHub setup.
+# Every line is shorter than 80 columns, so it reads well in any terminal.
+#
+# Copyright (c) 2026 anamulbahar. MIT License.
+# https://github.com/anamulbahar/dotfiles
+
+# Deliberate: word splitting ($OVERLAYS, package lists: SC2086, SC2046),
+# '~' in messages (SC2088), glob rules in case patterns (SC2254),
+# placeholder read fields (SC2034), literal '$' in messages (SC2016),
+# reading one file twice in a pipeline (SC2094), listing hook names
+# (SC2012). SC2218 is a false positive for functions called from main.
+# shellcheck disable=SC2086,SC2046,SC2088,SC2254,SC2034,SC2218,SC2209
+# shellcheck disable=SC1091,SC2016,SC2094,SC2012
+
+DOT_VERSION=1.3.0
+
+if [ -n "${ZSH_VERSION:-}" ]; then emulate -R sh; fi
+set -u
+
+SELF=$0
+NL='
+'
+TAB=$(printf '\t')
+
+# ------------------------------------------------------------ built-in rules
+
+# Paths that are never backed up. One glob per line.
+#   no slash  -> a file or folder name at any depth        (ssh, *.pem)
+#   a slash   -> a path from the top of ~/.config          (gh/hosts.yml*)
+# '*' also matches '/'. Add your own in dot.ignore; '!pattern' there forces
+# a path back in (the secret scanner still runs on it).
+default_rules() {
+    cat <<'EOF'
+# secrets, keys and credentials
+ssh
+gnupg
+.gnupg
+gpg
+pki
+keyring
+keyrings
+password-store
+pass
+*.kdbx
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+*.asc
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+.netrc
+netrc
+.git-credentials
+git-credentials
+credentials
+*credential*
+*secret*
+*token*
+.env
+.env.*
+*.env
+rclone.conf
+gh/hosts.yml*
+hub
+github-copilot
+gcloud
+aws
+azure
+doctl
+.kube
+kube
+docker/config.json
+op
+1Password
+Bitwarden
+sops/age
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.ldb
+# history, state, caches and machine noise
+.DS_Store
+.localized
+._*
+*.icloud
+Thumbs.db
+desktop.ini
+*history*
+*.hist
+.netrwhist
+*viminfo*
+vifminfo*
+.lesshst
+*.swp
+*.swo
+*~
+undo
+swap
+cache
+Cache
+caches
+.cache
+CachedData
+GPUCache
+Code Cache
+logs
+*.log
+*.pid
+*.sock
+*.local
+local.*
+node_modules
+__pycache__
+*.pyc
+sessions
+.git
+EOF
+}
+
+# Content patterns (POSIX ERE), printed as name<TAB>regex. A line that
+# contains "dot:allow" is never reported. Values are never printed, only
+# line numbers.
+rule_line() { printf '%s\t%s\n' "$1" "$2"; }
+secret_rules() {
+    rule_line 'private key' '-----BEGIN[ A-Z0-9]*PRIVATE KEY( BLOCK)?-----'
+    rule_line 'age secret key' 'AGE-SECRET-KEY-1[0-9A-Z]{58}'
+    rule_line 'GitHub token' 'gh[pousr]_[A-Za-z0-9]{36,}'
+    rule_line 'GitHub fine-grained token' 'github_pat_[A-Za-z0-9_]{60,}'
+    rule_line 'GitLab token' 'glpat-[A-Za-z0-9_-]{20,}'
+    rule_line 'Anthropic API key' 'sk-ant-[A-Za-z0-9_-]{32,}'
+    rule_line 'OpenAI API key' \
+        '(^|[^A-Za-z0-9_-])sk-(proj-|svcacct-)?[A-Za-z0-9_-]{32,}'
+    rule_line 'AWS access key' \
+        '(^|[^A-Z0-9])(AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}([^A-Z0-9]|$)'
+    rule_line 'Google API key' 'AIza[0-9A-Za-z_-]{35}'
+    rule_line 'Google OAuth token' 'ya29\.[0-9A-Za-z_-]{20,}'
+    rule_line 'Google OAuth secret' 'GOCSPX-[A-Za-z0-9_-]{20,}'
+    rule_line 'Slack token' 'xox[abposr]-[A-Za-z0-9-]{10,}'
+    rule_line 'Slack webhook' 'hooks\.slack\.com/services/T[A-Za-z0-9_/]+'
+    rule_line 'Stripe key' '(sk|rk)_live_[A-Za-z0-9]{20,}'
+    rule_line 'npm token' 'npm_[A-Za-z0-9]{36}'
+    rule_line 'PyPI token' 'pypi-AgE[A-Za-z0-9_-]{50,}'
+    rule_line 'Hugging Face token' 'hf_[A-Za-z0-9]{30,}'
+    rule_line 'DigitalOcean token' 'do[opr]_v1_[a-f0-9]{64}'
+    rule_line 'Telegram bot token' '[0-9]{8,10}:AA[A-Za-z0-9_-]{33}'
+    rule_line 'JSON web token' \
+        'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+    rule_line 'password in URL' \
+        '[A-Za-z][A-Za-z0-9+.-]*://[^/:@[:space:]]+:[^/@[:space:]]{3,}@'
+}
+# Case-insensitive patterns.
+secret_rules_ci() {
+    sr_k='(password|passwd|passphrase|secret|token|api[_-]?key'
+    sr_k="$sr_k|access[_-]?key|private[_-]?key|client[_-]?secret)"
+    sr_v="[\"']?[[:space:]]*[:=][[:space:]]*[\"']?"
+    sr_v="${sr_v}[^[:space:]\"'#,;\$<>{}()%]{8,}"
+    rule_line 'credential assignment' "$sr_k$sr_v"
+    sr_a='authorization:[[:space:]]*(bearer|basic|token)'
+    rule_line 'authorization header' \
+        "${sr_a}[[:space:]]+[A-Za-z0-9._~+/=-]{12,}"
+    sr_r='^[[:space:]]*(pass|password2?)[[:space:]]*='
+    rule_line 'rclone password' "${sr_r}[[:space:]]*[A-Za-z0-9_-]{16,}"
+}
+
+# -------------------------------------------------------------------- output
+
+color_init() {
+    C_0='' C_B='' C_D='' C_R='' C_G='' C_Y='' C_C=''
+    [ "$OPT_COLOR" = 1 ] || return 0
+    [ -z "${NO_COLOR:-}" ] && [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] ||
+        return 0
+    ci_e=$(printf '\033')
+    C_0="${ci_e}[0m" C_B="${ci_e}[1m" C_D="${ci_e}[2m" C_R="${ci_e}[31m"
+    C_G="${ci_e}[32m" C_Y="${ci_e}[33m" C_C="${ci_e}[36m"
+}
+say() { [ "$OPT_Q" = 1 ] || printf '%s\n' "$*"; }
+info() {
+    [ "$OPT_Q" = 1 ] ||
+        printf '%s==>%s %s%s%s\n' "$C_C" "$C_0" "$C_B" "$*" "$C_0"
+}
+ok() { [ "$OPT_Q" = 1 ] || printf '  %s+%s %s\n' "$C_G" "$C_0" "$*"; }
+chg() { [ "$OPT_Q" = 1 ] || printf '  %s~%s %s\n' "$C_Y" "$C_0" "$*"; }
+note() { [ "$OPT_Q" = 1 ] || printf '  %s-%s %s\n' "$C_D" "$C_0" "$*"; }
+vrb() {
+    [ "$OPT_V" = 1 ] && printf '  %s.%s %s\n' "$C_D" "$C_0" "$*"
+    return 0
+}
+bad() { printf '  %sx%s %s\n' "$C_R" "$C_0" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die() {
+    printf '%serror:%s %s\n' "$C_R" "$C_0" "$*" >&2
+    exit 1
+}
+
+# pp <path>: print a path with $HOME shortened to ~
+pp() {
+    case $1 in
+    "$HOME") printf '~' ;;
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *) printf '%s' "$1" ;;
+    esac
+}
+count() {
+    cnt_n=$(wc -l <"$1" 2>/dev/null) || cnt_n=0
+    printf '%s' $((cnt_n))
+}
+# strip_comments <file>: the file without comment and blank lines
+strip_comments() { grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$1"; }
+
+# ------------------------------------------------------------------- prompts
+
+tty_init() {
+    HAVE_TTY=0
+    if (exec </dev/tty) 2>/dev/null; then
+        if [ -t 1 ] || [ -t 2 ]; then HAVE_TTY=1; fi
+    fi
+}
+# ask <question> <default>: answer in $REPLY (default when not interactive)
+ask() {
+    REPLY=$2
+    [ "$OPT_YES" = 1 ] && return 0
+    [ "$HAVE_TTY" = 1 ] || return 0
+    if [ -n "$2" ]; then
+        printf '%s%s%s [%s] ' "$C_B" "$1" "$C_0" "$2" >/dev/tty
+    else
+        printf '%s%s%s ' "$C_B" "$1" "$C_0" >/dev/tty
+    fi
+    IFS= read -r REPLY </dev/tty || REPLY=''
+    [ -n "$REPLY" ] || REPLY=$2
+}
+# confirm <question> [y|n]: --yes answers yes, no terminal gives the default
+confirm() {
+    cf_def=${2:-y}
+    [ "$OPT_YES" = 1 ] && return 0
+    if [ "$HAVE_TTY" != 1 ]; then
+        [ "$cf_def" = y ]
+        return
+    fi
+    if [ "$cf_def" = y ]; then cf_hint='[Y/n]'; else cf_hint='[y/N]'; fi
+    while :; do
+        printf '%s%s%s %s ' "$C_B" "$1" "$C_0" "$cf_hint" >/dev/tty
+        IFS= read -r cf_a </dev/tty || cf_a=''
+        [ -n "$cf_a" ] || cf_a=$cf_def
+        case $cf_a in
+        [Yy] | [Yy][Ee][Ss]) return 0 ;;
+        [Nn] | [Nn][Oo]) return 1 ;;
+        esac
+    done
+}
+# tty_default: "y" when someone can answer, "n" otherwise
+tty_default() { if [ "$HAVE_TTY" = 1 ]; then echo y; else echo n; fi; }
+
+# --------------------------------------------------------------------- paths
+
+readlink_() {
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -- "$1"
+    else
+        # no readlink: ls is the portable fallback
+        ls -ld -- "$1" | sed 's/^.* -> //'
+    fi
+}
+# canon <path>: absolute physical path, all symlinks resolved (need not exist)
+canon() {
+    cn_p=$1 cn_i=0
+    case $cn_p in /*) ;; *) cn_p=$PWD/$cn_p ;; esac
+    while [ -L "$cn_p" ] && [ "$cn_i" -lt 40 ]; do
+        cn_t=$(readlink_ "$cn_p")
+        case $cn_t in /*) cn_p=$cn_t ;; *) cn_p=${cn_p%/*}/$cn_t ;; esac
+        cn_i=$((cn_i + 1))
+    done
+    if [ -d "$cn_p" ]; then
+        (cd -P -- "$cn_p" 2>/dev/null && pwd -P) && return 0
+    fi
+    cn_d=$(cd -P -- "${cn_p%/*}/" 2>/dev/null && pwd -P) || {
+        printf '%s\n' "$cn_p"
+        return 0
+    }
+    printf '%s/%s\n' "${cn_d%/}" "${cn_p##*/}"
+}
+self_dir() {
+    sd_p=$SELF
+    case $sd_p in
+    */*) ;;
+    *)
+        if [ -f "$sd_p" ]; then
+            sd_p=./$sd_p
+        else
+            sd_p=$(command -v -- "$sd_p" 2>/dev/null) || return 1
+        fi
+        ;;
+    esac
+    [ -f "$sd_p" ] || return 1
+    sd_p=$(canon "$sd_p")
+    printf '%s\n' "${sd_p%/*}"
+}
+is_repo() { [ -f "$1/dot" ] && { [ -d "$1/config" ] || [ -d "$1/.git" ]; }; }
+
+env_init() {
+    TARGET=${DOT_TARGET:-${XDG_CONFIG_HOME:-$HOME/.config}}
+    [ "$TARGET" = / ] || TARGET=${TARGET%/}
+    STATE=${DOT_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dot}
+    MAX_SIZE=${DOT_MAX_SIZE:-1048576}
+    OS=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    case $OS in mingw* | msys* | cygwin*) OS=windows ;; '') OS=unknown ;; esac
+    DISTRO=''
+    if [ -r /etc/os-release ]; then
+        DISTRO=$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-}")
+        DISTRO=$(printf '%s' "$DISTRO" | tr -c 'A-Za-z0-9_-' '-')
+    fi
+    HOST=''
+    if [ "$OS" = darwin ] && command -v scutil >/dev/null 2>&1; then
+        HOST=$(scutil --get LocalHostName 2>/dev/null)
+    fi
+    [ -n "$HOST" ] || HOST=$(uname -n 2>/dev/null)
+    HOST=$(printf '%s' "${HOST%%.*}" | tr -c 'A-Za-z0-9_-' '-')
+    [ -n "$HOST" ] || HOST=unknown
+    # Later overlays win: common config < os < distro < host.
+    OVERLAYS="overlay/os.$OS"
+    if [ -n "$DISTRO" ] && [ "$DISTRO" != "$OS" ]; then
+        OVERLAYS="$OVERLAYS overlay/os.$DISTRO"
+    fi
+    OVERLAYS="$OVERLAYS overlay/host.$HOST"
+    OVERLAYS_REV=''
+    for ei_o in $OVERLAYS; do OVERLAYS_REV="$ei_o $OVERLAYS_REV"; done
+}
+root_init() {
+    DOT_ROOT=''
+    if [ -n "${DOT_DIR:-}" ]; then
+        DOT_ROOT=$(canon "$DOT_DIR")
+        return 0
+    fi
+    if ri_d=$(self_dir 2>/dev/null) && is_repo "$ri_d"; then DOT_ROOT=$ri_d; fi
+}
+require_repo() {
+    [ -n "$DOT_ROOT" ] || die "not inside a dotfiles repo." \
+        "New machine? Run: dot bootstrap <github-user>  (or set DOT_DIR)"
+    is_repo "$DOT_ROOT" ||
+        die "not a dot repo: $DOT_ROOT (no 'dot' script or config/ folder)"
+    if is_git; then hooks_install; fi
+}
+is_git() { command -v git >/dev/null 2>&1 && [ -e "$DOT_ROOT/.git" ]; }
+g() { git -C "$DOT_ROOT" "$@"; }
+need() {
+    command -v "$1" >/dev/null 2>&1 && return 0
+    case $1 in
+    git) die "git is not installed. Install it first, e.g.:" \
+        "$(install_hint git)" ;;
+    *) die "$1 is not installed" ;;
+    esac
+}
+install_hint() {
+    if [ "$OS" = darwin ]; then
+        printf 'xcode-select --install   (or: brew install %s)' "$1"
+    elif command -v apk >/dev/null 2>&1; then
+        printf 'apk add %s' "$1"
+    elif command -v apt-get >/dev/null 2>&1; then
+        printf 'sudo apt-get install %s' "$1"
+    elif command -v dnf >/dev/null 2>&1; then
+        printf 'sudo dnf install %s' "$1"
+    elif command -v pacman >/dev/null 2>&1; then
+        printf 'sudo pacman -S %s' "$1"
+    elif command -v pkg >/dev/null 2>&1; then
+        printf 'pkg install %s' "$1"
+    else
+        printf 'your package manager'
+    fi
+}
+
+tmp_init() {
+    TMP=$(mktemp -d "${TMPDIR:-/tmp}/dot.XXXXXX" 2>/dev/null) || {
+        TMP=${TMPDIR:-/tmp}/dot.$$
+        (umask 077 && mkdir "$TMP") || die "cannot create a temporary folder"
+    }
+    PAT_CS=$TMP/pat_cs
+    PAT_CI=$TMP/pat_ci
+    secret_rules | cut -f2- >"$PAT_CS"
+    secret_rules_ci | cut -f2- >"$PAT_CI"
+}
+cleanup() {
+    if [ -n "${TMP:-}" ] && [ -d "$TMP" ]; then rm -rf -- "$TMP"; fi
+    if [ "${LOCKED:-0}" = 1 ]; then rm -rf -- "$STATE/lock"; fi
+}
+lock() {
+    [ "$LOCKED" = 1 ] && return 0
+    mkdir -p -- "$STATE" || die "cannot create $STATE"
+    if ! mkdir -- "$STATE/lock" 2>/dev/null; then
+        lk_pid=$(cat "$STATE/lock/pid" 2>/dev/null) || lk_pid=''
+        if [ -n "$lk_pid" ] && kill -0 "$lk_pid" 2>/dev/null; then
+            die "another dot is running (pid $lk_pid)"
+        fi
+        rm -rf -- "$STATE/lock"
+        mkdir -- "$STATE/lock" || die "cannot lock $STATE"
+    fi
+    printf '%s\n' "$$" >"$STATE/lock/pid"
+    LOCKED=1
+}
+
+# -------------------------------------------------------- rules and scanning
+
+rules_clean() {
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e '/^#/d' -e '/^$/d' -e 's#/$##'
+}
+load_rules() {
+    lr_all=$({
+        default_rules
+        if [ -n "$DOT_ROOT" ] && [ -f "$DOT_ROOT/dot.ignore" ]; then
+            cat -- "$DOT_ROOT/dot.ignore"
+        fi
+    } | rules_clean)
+    IGNORE_RULES=$(printf '%s\n' "$lr_all" | grep -v '^!')
+    ALLOW_RULES=$(printf '%s\n' "$lr_all" | sed -n 's/^!//p')
+    SECRET_RELS=$(secret_list 2>/dev/null)
+}
+# rule_match <rel> <rules>: 0 if a rule matches; the rule is left in $RM_PAT
+rule_match() {
+    RM_PAT=''
+    rm_oifs=$IFS
+    IFS=$NL
+    set -f
+    for rm_p in $2; do
+        case $rm_p in
+        */*) case $1 in $rm_p | $rm_p/*) RM_PAT=$rm_p && break ;; esac ;;
+        *) case /$1/ in */$rm_p/*) RM_PAT=$rm_p && break ;; esac ;;
+        esac
+    done
+    set +f
+    IFS=$rm_oifs
+    [ -n "$RM_PAT" ]
+}
+rule_allowed() { [ -n "$ALLOW_RULES" ] && rule_match "$1" "$ALLOW_RULES"; }
+# ignored <rel>: 0 if path rules keep <rel> out ($RM_PAT says which)
+ignored() { ! rule_allowed "$1" && rule_match "$1" "$IGNORE_RULES"; }
+# allow_inside <dir-rel>: an allow rule names something inside this folder
+allow_inside() {
+    case $NL$ALLOW_RULES in *"$NL$1/"*) return 0 ;; esac
+    return 1
+}
+is_binary() { ! LC_ALL=C tr -d '\000' <"$1" | cmp -s - "$1"; }
+
+# secret_scan <file>: 0 if the file looks like it holds a secret; $SCAN_HIT
+# describes the first hit (rule and line number, never the value)
+secret_scan() {
+    SCAN_HIT=''
+    ss_hits=$({
+        LC_ALL=C grep -n -E -f "$PAT_CS" -- "$1"
+        LC_ALL=C grep -n -i -E -f "$PAT_CI" -- "$1"
+    } 2>/dev/null | LC_ALL=C grep -v -E 'dot:allow|gitleaks:allow')
+    [ -n "$ss_hits" ] || return 1
+    ss_first=$(printf '%s\n' "$ss_hits" | sort -t: -k1,1n | head -n 1)
+    ss_n=$(printf '%s\n' "$ss_hits" | cut -d: -f1 | sort -u | wc -l)
+    ss_n=$((ss_n))
+    SCAN_HIT="line ${ss_first%%:*}: $(rule_name "${ss_first#*:}")"
+    [ "$ss_n" -gt 1 ] && SCAN_HIT="$SCAN_HIT (+$((ss_n - 1)) more lines)"
+    return 0
+}
+# rule_name <line>: the name of the first secret pattern the line matches
+rule_name() {
+    {
+        secret_rules | sed "s/^/cs$TAB/"
+        secret_rules_ci | sed "s/^/ci$TAB/"
+    } | while IFS=$TAB read -r rn_k rn_name rn_re; do
+        if [ "$rn_k" = ci ]; then rn_i=-i; else rn_i=''; fi
+        if printf '%s\n' "$1" | LC_ALL=C grep -q $rn_i -E -e "$rn_re"; then
+            printf '%s\n' "$rn_name"
+            exit 0
+        fi
+    done
+}
+# privacy_scan <file>: kinds of personal info found (hints, never blocks)
+privacy_scan() {
+    ps_k=''
+    ps_mail='[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
+    ps_safe='(^|[^A-Za-z0-9._%+-])(git|noreply)@|users\.noreply\.github\.com'
+    if LC_ALL=C grep -E "$ps_mail" -- "$1" 2>/dev/null |
+        LC_ALL=C grep -q -v -E "$ps_safe"; then
+        ps_k='email'
+    fi
+    ps_ip='(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9.]|$)'
+    ps_lo='(^|[^0-9.])(127\.0\.0\.1|0\.0\.0\.0|255\.255\.255\.[0-9]+)'
+    ps_lo="$ps_lo([^0-9.]|\$)"
+    if LC_ALL=C grep -E "$ps_ip" -- "$1" 2>/dev/null |
+        LC_ALL=C grep -q -v -E "$ps_lo"; then
+        ps_k="${ps_k:+$ps_k, }IP address"
+    fi
+    if LC_ALL=C grep -q -E '/(Users|home)/[A-Za-z0-9._-]+' -- "$1" 2>/dev/null
+    then
+        ps_k="${ps_k:+$ps_k, }home path"
+    fi
+    printf '%s' "$ps_k"
+}
+
+# classify <rel> <abs>: CLS=take|skip, WHY=reason
+classify() {
+    CLS=skip
+    case $1 in
+    *"$TAB"* | *"$NL"*) WHY='unsupported characters in name' && return 0 ;;
+    esac
+    if is_secret "$1"; then
+        WHY='encrypted secret (dot.secrets)'
+        return 0
+    fi
+    cl_allowed=0
+    if rule_allowed "$1"; then
+        cl_allowed=1
+    elif rule_match "$1" "$IGNORE_RULES"; then
+        WHY="rule '$RM_PAT'"
+        return 0
+    fi
+    if [ ! -r "$2" ]; then WHY='unreadable' && return 0; fi
+    cl_size=$(wc -c <"$2" 2>/dev/null) || cl_size=0
+    cl_size=$((cl_size))
+    if [ "$cl_allowed" = 0 ] && [ "$cl_size" -gt "$MAX_SIZE" ]; then
+        WHY="too large ($cl_size bytes; raise DOT_MAX_SIZE or 'dot allow' it)"
+        return 0
+    fi
+    if [ "$cl_allowed" = 0 ] && is_binary "$2"; then
+        WHY='binary file'
+        return 0
+    fi
+    if secret_scan "$2"; then WHY="secret: $SCAN_HIT" && return 0; fi
+    CLS=take
+    if [ "$cl_allowed" = 1 ]; then WHY=allowed; else WHY=ok; fi
+}
+
+# ------------------------------------------------- capture: walk ~/.config
+
+# plan <kind> <fields...>: print one tab-separated plan line
+plan() {
+    pl_l=$1
+    shift
+    for pl_f; do pl_l="$pl_l$TAB$pl_f"; done
+    printf '%s\n' "$pl_l"
+}
+# walk <dir-rel>: print one plan line per entry below $TARGET/<dir-rel>
+#   TAKE rel why | SKIP rel why | LINK rel value | PLUG rel url ref
+walk() {
+    if [ -n "$1" ]; then
+        w_base=$TARGET/$1 w_pre=$1/
+    else
+        w_base=$TARGET w_pre=''
+    fi
+    for w_e in "$w_base"/* "$w_base"/.[!.]* "$w_base"/..?*; do
+        [ -e "$w_e" ] || [ -L "$w_e" ] || continue
+        w_rel=$w_pre${w_e##*/}
+        case $w_rel in *"$TAB"* | *"$NL"*)
+            plan SKIP "$(printf '%s' "$w_rel" | tr '\t\n' '??')" \
+                'unsupported characters in name'
+            continue
+            ;;
+        esac
+        if [ -L "$w_e" ]; then
+            walk_link "$w_rel" "$w_e"
+        elif [ -d "$w_e" ]; then
+            if ignored "$w_rel" && ! allow_inside "$w_rel"; then
+                plan SKIP "$w_rel/" "rule '$RM_PAT'"
+            elif [ -e "$w_e/.git" ]; then
+                walk_repo "$w_rel" "$w_e"
+            elif [ "$(canon "$w_e")" = "$DOT_ROOT" ]; then
+                plan SKIP "$w_rel/" 'this dotfiles repo'
+            else
+                (walk "$w_rel")
+            fi
+        elif [ -f "$w_e" ]; then
+            classify "$w_rel" "$w_e"
+            if [ "$CLS" = take ]; then
+                plan TAKE "$w_rel" "$WHY"
+            else
+                plan SKIP "$w_rel" "$WHY"
+            fi
+        fi
+    done
+}
+walk_link() {
+    if ignored "$1"; then plan SKIP "$1" "rule '$RM_PAT'" && return 0; fi
+    wl_t=$(readlink_ "$2")
+    case $wl_t in
+    /*) plan SKIP "$1" 'symlink to an absolute path' && return 0 ;;
+    esac
+    case $(canon "$2") in
+    "$TARGET_REAL"/*) plan LINK "$1" "$wl_t" ;;
+    *) plan SKIP "$1" 'symlink points outside the config folder' ;;
+    esac
+}
+walk_repo() {
+    if [ "$(canon "$2")" = "$DOT_ROOT" ]; then
+        plan SKIP "$1/" 'this dotfiles repo'
+        return 0
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        plan SKIP "$1/" 'git repo (git not installed)'
+        return 0
+    fi
+    wr_url=$(git -C "$2" config --get remote.origin.url 2>/dev/null |
+        sed 's#://[^/@]*@#://#')
+    if [ -z "$wr_url" ]; then
+        plan SKIP "$1/" 'git repo without a remote'
+        return 0
+    fi
+    wr_ref=$(git -C "$2" symbolic-ref -q --short HEAD 2>/dev/null) ||
+        wr_ref=$(git -C "$2" rev-parse HEAD 2>/dev/null) || wr_ref=HEAD
+    plan PLUG "$1" "$wr_url" "${wr_ref:-HEAD}"
+}
+
+# capture_dest <rel>: where <rel> lives in the repo -> $CD_PATH
+# (an overlay copy for this machine wins over the common one)
+capture_dest() {
+    for cd_o in $OVERLAYS_REV; do
+        if [ -e "$DOT_ROOT/$cd_o/$1" ] || [ -L "$DOT_ROOT/$cd_o/$1" ]; then
+            CD_PATH=$DOT_ROOT/$cd_o/$1
+            return 0
+        fi
+    done
+    CD_PATH=$DOT_ROOT/config/$1
+}
+# exists <path>: true for files, folders and (even broken) symlinks
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
+
+capture_analyze() {
+    TARGET_REAL=$(canon "$TARGET")
+    walk '' >"$TMP/plan"
+    for ca_f in new mod same taken secret rule other plug force enc tmpl; do
+        : >"$TMP/cap.$ca_f"
+    done
+    while IFS=$TAB read -r ca_k ca_a ca_b ca_c; do
+        case $ca_k in
+        TAKE | LINK)
+            printf '%s\n' "$ca_a" >>"$TMP/cap.taken"
+            if tpl_source "$ca_a"; then
+                printf '%s\n' "$ca_a" >>"$TMP/cap.tmpl"
+                continue
+            fi
+            capture_dest "$ca_a"
+            if [ "$ca_k" = TAKE ]; then
+                if [ "$ca_b" = allowed ]; then
+                    printf '%s\n' "$CD_PATH" >>"$TMP/cap.force"
+                fi
+                if [ -f "$CD_PATH" ] && [ ! -L "$CD_PATH" ] &&
+                    cmp -s -- "$TARGET/$ca_a" "$CD_PATH"; then
+                    ca_to=same
+                elif exists "$CD_PATH"; then
+                    ca_to=mod
+                else
+                    ca_to=new
+                fi
+                plan file "$ca_a" "$CD_PATH" - >>"$TMP/cap.$ca_to"
+            else
+                if [ -L "$CD_PATH" ] &&
+                    [ "$(readlink_ "$CD_PATH")" = "$ca_b" ]; then
+                    ca_to=same
+                elif exists "$CD_PATH"; then
+                    ca_to=mod
+                else
+                    ca_to=new
+                fi
+                plan link "$ca_a" "$CD_PATH" "$ca_b" >>"$TMP/cap.$ca_to"
+            fi
+            ;;
+        SKIP)
+            case $ca_b in
+            secret:*) ca_to=secret ;;
+            encrypted*) ca_to=enc ;;
+            rule*) ca_to=rule ;;
+            *) ca_to=other ;;
+            esac
+            plan "$ca_a" "$ca_b" >>"$TMP/cap.$ca_to"
+            ;;
+        PLUG)
+            printf '%s %s %s\n' "$ca_a" "$ca_b" "$ca_c" >>"$TMP/cap.plug"
+            ;;
+        esac
+    done <"$TMP/plan"
+    # Files in the repo that this machine no longer provides.
+    if [ -d "$DOT_ROOT/config" ]; then
+        (cd "$DOT_ROOT/config" && find . \( -type f -o -type l \) -print) |
+            sed -e 's#^\./##' -e 's/\.tmpl$//' |
+            grep -v -x -F -e .gitkeep -e .DS_Store |
+            LC_ALL=C sort -u >"$TMP/repo.list"
+    else
+        : >"$TMP/repo.list"
+    fi
+    LC_ALL=C sort -u "$TMP/cap.taken" >"$TMP/taken.sorted"
+    LC_ALL=C comm -23 "$TMP/repo.list" "$TMP/taken.sorted" >"$TMP/cap.stale"
+}
+
+repo_put_file() { # repo_put_file <src> <dst>
+    rp_d=${2%/*}
+    mkdir -p -- "$rp_d" || return 1
+    if [ -d "$2" ] && [ ! -L "$2" ]; then
+        warn "repo has a folder at $(pp "$2")"
+        return 1
+    fi
+    [ -L "$2" ] && rm -f -- "$2"
+    cp -- "$1" "$rp_d/.dot-tmp.$$" && mv -f -- "$rp_d/.dot-tmp.$$" "$2"
+}
+repo_put_link() { # repo_put_link <value> <dst>
+    rp_d=${2%/*}
+    mkdir -p -- "$rp_d" || return 1
+    rm -f -- "$2"
+    ln -s -- "$1" "$2"
+}
+
+plugins_update_manifest() {
+    [ -s "$TMP/cap.plug" ] || return 0
+    pm_f=$DOT_ROOT/dot.plugins
+    {
+        printf '%s\n' \
+            '# Plugins re-cloned by "dot apply" instead of being copied.' \
+            '# Written by "dot capture".' \
+            '# Format: <path in ~/.config> <git url> <branch|tag|commit>'
+        {
+            if [ -f "$pm_f" ]; then
+                strip_comments "$pm_f" |
+                    awk 'NF >= 2 { print $1, $2, ($3 == "" ? "HEAD" : $3) }'
+            fi
+            cat "$TMP/cap.plug"
+        } | awk '{ if (!($1 in e)) o[++n] = $1; e[$1] = $0 }
+            END { for (i = 1; i <= n; i++) print e[o[i]] }'
+    } >"$TMP/plugins.new"
+    if [ ! -f "$pm_f" ] || ! cmp -s "$TMP/plugins.new" "$pm_f"; then
+        cp -- "$TMP/plugins.new" "$pm_f"
+    fi
+}
+
+links_header() {
+    printf '%s\n' \
+        '# Home-folder files made by "dot apply" and "dot link".' \
+        '#   <path under ~>  <path under ~/.config>  [source] [os=|host=]' \
+        '# Default: ~/<path> becomes a symlink. A target ending in / is a' \
+        '# folder, created (mode 700) if missing. "source": an existing' \
+        '# file is kept and gets one line that loads the target; a missing' \
+        '# one becomes a symlink (used for ~/.zshrc and ~/.bashrc).'
+}
+# has_entry <name> <file>: the file has a line whose first field is <name>
+has_entry() { awk -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$2"; }
+# home_links_capture: record ~/.name -> ~/.config/... symlinks in dot.links
+home_links_capture() {
+    hl_f=$DOT_ROOT/dot.links
+    hl_t=$(canon "$TARGET")
+    for hl_e in "$HOME"/.[!.]* "$HOME"/..?*; do
+        [ -L "$hl_e" ] || continue
+        hl_name=${hl_e##*/}
+        hl_c=$(canon "$hl_e")
+        case $hl_c in "$hl_t"/*) hl_rel=${hl_c#"$hl_t"/} ;; *) continue ;; esac
+        [ -d "$hl_e" ] && hl_rel=$hl_rel/
+        if [ -f "$hl_f" ] && has_entry "$hl_name" "$hl_f"; then continue; fi
+        [ -f "$hl_f" ] || links_header >"$hl_f"
+        # shell rc files use source mode: other machines keep theirs
+        hl_mode=''
+        case $hl_name in .zshrc | .bashrc) hl_mode=source ;; esac
+        printf '%-20s %-12s %s\n' "$hl_name" "$hl_rel" "$hl_mode" |
+            sed 's/[[:space:]]*$//' >>"$hl_f"
+        ok "link recorded: ~/$hl_name -> $hl_rel${hl_mode:+ ($hl_mode)}"
+    done
+}
+
+git_add_capture() {
+    set --
+    for ga_p in dot config overlay dot.links dot.plugins dot.ignore \
+        dot.secrets dot.vars .gitignore hooks packages assets; do
+        [ -e "$DOT_ROOT/$ga_p" ] && set -- "$@" "$ga_p"
+    done
+    [ $# -gt 0 ] && g add -A -- "$@"
+    # encrypted files; forced, since their names may match ignore rules
+    [ -d "$DOT_ROOT/secrets" ] && g add -A -f -- secrets
+    while IFS= read -r ga_f; do
+        g add -f -- "${ga_f#"$DOT_ROOT"/}"
+    done <"$TMP/cap.force"
+}
+
+# capture_report: say what was kept out of the repo, and why
+capture_report() {
+    if [ -s "$TMP/cap.secret" ]; then
+        say "${C_R}Kept out - secrets found inside:${C_0}"
+        while IFS=$TAB read -r cr_rel cr_why; do
+            bad "$cr_rel  ($cr_why)"
+        done <"$TMP/cap.secret"
+        note "false positive? end that line with a 'dot:allow' comment"
+    fi
+    if [ -s "$TMP/cap.rule" ]; then
+        cr_sum=$(cut -f1 "$TMP/cap.rule" | sed 's#/$##' |
+            awk -F/ '{ c[$1]++; if (NF > 1) d[$1] = 1 }
+                END { for (k in c) print (k in d ? k "/ (" c[k] ")" : k) }' |
+            LC_ALL=C sort | paste -s -d, - | sed 's/,/, /g')
+        say "${C_D}Kept out by rules:${C_0} $cr_sum"
+        if [ "$OPT_V" = 1 ]; then
+            while IFS=$TAB read -r cr_rel cr_why; do
+                vrb "$cr_rel  ($cr_why)"
+            done <"$TMP/cap.rule"
+        fi
+    fi
+    if [ -s "$TMP/cap.other" ]; then
+        say "${C_D}Kept out (other):${C_0} $(count "$TMP/cap.other") file(s)"
+        while IFS=$TAB read -r cr_rel cr_why; do
+            note "$cr_rel  ($cr_why)"
+        done <"$TMP/cap.other"
+    fi
+    if [ -s "$TMP/cap.tmpl" ]; then
+        say "${C_D}Made from templates (edit the .tmpl in the repo," \
+            "not these):${C_0} $(paste -s -d' ' - <"$TMP/cap.tmpl")"
+    fi
+    if [ -s "$TMP/cap.enc" ] && [ "$CAP_SECRETS" != 1 ]; then
+        say "${C_D}Stored encrypted (dot.secrets):${C_0}" \
+            "$(count "$TMP/cap.enc") file(s); update with --secrets"
+    fi
+    if [ -s "$TMP/cap.plug" ]; then
+        say "${C_D}Plugins recorded in dot.plugins" \
+            "(re-cloned, not copied):${C_0}"
+        while read -r cr_p cr_u cr_r; do
+            note "$cr_p  <- $cr_u ($cr_r)"
+        done <"$TMP/cap.plug"
+    fi
+}
+# capture_stale <prune>: report (or remove) repo files this machine lacks
+capture_stale() {
+    [ "$(count "$TMP/cap.stale")" -gt 0 ] || return 0
+    say "${C_Y}In the repo but not provided by this machine:${C_0}"
+    while IFS= read -r cs_rel; do
+        cs_why='missing here'
+        if [ -e "$TARGET/$cs_rel" ]; then
+            cs_why=$(awk -F'\t' -v r="$cs_rel" '$2 == r ||
+                (substr($2, length($2)) == "/" && index(r, $2) == 1) {
+                    print $3; exit }' "$TMP/plan")
+            case $cs_why in secret:*)
+                warn "the repo holds $cs_rel, which now looks like a" \
+                    "secret ($cs_why). Run: dot capture --prune," \
+                    "then rotate that secret."
+                ;;
+            esac
+            cs_why="now excluded: ${cs_why:-?}"
+        fi
+        if [ "$1" = 1 ] && [ "$OPT_DRY" != 1 ]; then
+            rm -f -- "$DOT_ROOT/config/$cs_rel" "$DOT_ROOT/config/$cs_rel.tmpl"
+            bad "$cs_rel  (removed from repo; $cs_why)"
+        else
+            note "$cs_rel  ($cs_why)"
+        fi
+    done <"$TMP/cap.stale"
+    [ "$1" = 1 ] || note "remove them from the repo with:" \
+        "dot capture --prune  (git history keeps them)"
+}
+
+cmd_capture() {
+    cc_prune=0 cc_commit=1 cc_msg='' cc_push=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --secrets) CAP_SECRETS=1 ;;
+        --prune) cc_prune=1 ;;
+        --no-commit) cc_commit=0 ;;
+        --push) cc_push=1 ;;
+        -m | --message)
+            [ $# -ge 2 ] || die "$1 needs a value"
+            cc_msg=$2
+            shift
+            ;;
+        *) common_flag "$1" || die "capture: unknown option $1" ;;
+        esac
+        shift
+    done
+    require_repo
+    load_rules
+    [ -d "$TARGET" ] ||
+        die "nothing to capture: $(pp "$TARGET") does not exist"
+    [ "$OPT_DRY" = 1 ] || lock
+    run_hook pre-capture
+    info "Capturing $(pp "$TARGET") -> $(pp "$DOT_ROOT")"
+    capture_analyze
+    cc_new=$(count "$TMP/cap.new") cc_mod=$(count "$TMP/cap.mod")
+    cc_same=$(count "$TMP/cap.same")
+
+    {
+        sed "s/^/+$TAB/" "$TMP/cap.new"
+        sed "s/^/~$TAB/" "$TMP/cap.mod"
+    } >"$TMP/cap.todo"
+    while IFS=$TAB read -r cc_s cc_k cc_rel cc_dst cc_val; do
+        cc_pv=''
+        [ "$cc_k" = file ] && cc_pv=$(privacy_scan "$TARGET/$cc_rel")
+        if [ "$OPT_DRY" != 1 ]; then
+            if [ "$cc_k" = link ]; then
+                repo_put_link "$cc_val" "$cc_dst"
+            else
+                repo_put_file "$TARGET/$cc_rel" "$cc_dst"
+            fi || { warn "could not copy $cc_rel" && continue; }
+        fi
+        if [ "$cc_s" = + ]; then ok "$cc_rel"; else chg "$cc_rel"; fi
+        [ -n "$cc_pv" ] &&
+            note "  contains: $cc_pv (fine for a private repo)"
+    done <"$TMP/cap.todo"
+    if [ "$OPT_DRY" != 1 ]; then
+        plugins_update_manifest
+        home_links_capture
+    fi
+    [ "$CAP_SECRETS" = 1 ] && secrets_capture
+    capture_report
+    capture_stale "$cc_prune"
+    say "$cc_new new, $cc_mod updated, $cc_same unchanged."
+
+    if [ "$OPT_DRY" = 1 ]; then
+        note 'dry run: nothing was written'
+        return 0
+    fi
+    gitignore_ensure
+    run_hook post-capture
+    if [ "$cc_commit" = 1 ] && is_git; then
+        git_add_capture
+        if ! g diff --cached --quiet; then
+            [ -n "$cc_msg" ] ||
+                cc_msg="capture from $HOST: $cc_new new, $cc_mod updated"
+            if g commit -q -m "$cc_msg"; then
+                ok "committed: $cc_msg"
+            else
+                die 'commit refused (see above). Nothing was pushed.'
+            fi
+        else
+            note 'nothing new to commit:' \
+                'your config is exactly as you left it'
+        fi
+        [ "$cc_push" = 1 ] && git_push
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------- apply
+
+# effective_files: "rel<TAB>source" for everything apply would install:
+# config/, then this machine's overlays, templates rendered, and (with
+# --secrets) decrypted secrets. Later entries win.
+effective_files() {
+    {
+        for ef_sub in config $OVERLAYS; do
+            ef_dir=$DOT_ROOT/$ef_sub
+            [ -d "$ef_dir" ] || continue
+            (cd "$ef_dir" && find . \( -type f -o -type l \) -print) |
+                sed 's#^\./##' |
+                while IFS= read -r ef_rel; do
+                    case $ef_rel in
+                    .gitkeep) ;;
+                    *.tmpl) effective_template "$ef_dir" "$ef_rel" ;;
+                    *) printf '%s\t%s\n' "$ef_rel" "$ef_dir/$ef_rel" ;;
+                    esac
+                done
+        done
+        [ "$AP_SECRETS" = 1 ] && secrets_effective
+    } | awk -F'\t' '{ if (!($1 in s)) o[++n] = $1; s[$1] = $2 }
+        END { for (i = 1; i <= n; i++) print o[i] "\t" s[o[i]] }'
+}
+# effective_template <dir> <rel.tmpl>: render it, print "rel<TAB>file"
+effective_template() {
+    et_r=${2%.tmpl}
+    et_o=$TMP/tpl/${1#"$DOT_ROOT"/}/$et_r
+    mkdir -p -- "${et_o%/*}"
+    if render "$1/$2" "$et_o"; then
+        printf '%s\t%s\n' "$et_r" "$et_o"
+    else
+        warn "template $2 has errors (see above); skipped"
+    fi
+}
+# from_tmp <path>: the file was made by dot (a rendered template or a
+# decrypted secret), so it is copied, never linked, and not rule-checked
+from_tmp() { case $1 in "$TMP"/*) return 0 ;; esac; return 1; }
+# file_mode <source>: how to install it (link mode never links dot's files)
+file_mode() { if from_tmp "$1"; then echo copy; else echo "$AP_MODE"; fi; }
+
+apply_analyze() {
+    effective_files >"$TMP/eff"
+    for aa_f in new same mod relink block; do : >"$TMP/ap.$aa_f"; done
+    while IFS=$TAB read -r aa_rel aa_src; do
+        if ! from_tmp "$aa_src" && ignored "$aa_rel"; then continue; fi
+        aa_dst=$TARGET/$aa_rel
+        if [ -d "$aa_dst" ] && [ ! -L "$aa_dst" ]; then
+            aa_to=block
+        elif ! exists "$aa_dst"; then
+            aa_to=new
+        elif [ "$AP_MODE" = link ] && [ ! -L "$aa_src" ] &&
+            ! from_tmp "$aa_src"; then
+            if [ -L "$aa_dst" ] &&
+                [ "$(canon "$aa_dst")" = "$(canon "$aa_src")" ]; then
+                aa_to=same
+            elif [ -f "$aa_dst" ] && [ ! -L "$aa_dst" ] &&
+                cmp -s -- "$aa_src" "$aa_dst"; then
+                aa_to=relink
+            else
+                aa_to=mod
+            fi
+        elif [ -L "$aa_src" ]; then
+            if [ -L "$aa_dst" ] &&
+                [ "$(readlink_ "$aa_dst")" = "$(readlink_ "$aa_src")" ]; then
+                aa_to=same
+            else
+                aa_to=mod
+            fi
+        elif cmp -s -- "$aa_src" "$aa_dst" 2>/dev/null; then
+            aa_to=same
+        else
+            aa_to=mod
+        fi
+        printf '%s\t%s\n' "$aa_rel" "$aa_src" >>"$TMP/ap.$aa_to"
+    done <"$TMP/eff"
+}
+
+# put_file <src> <dst> <copy|link>: atomic install that keeps the
+# permissions of a file it replaces
+put_file() {
+    pf_d=${2%/*}
+    mkdir -p -- "$pf_d" 2>/dev/null ||
+        { warn "cannot create $(pp "$pf_d")" && return 1; }
+    pf_t=$pf_d/.dot-tmp.$$
+    rm -f -- "$pf_t"
+    if [ "$3" = link ]; then
+        ln -s -- "$1" "$pf_t" || return 1
+    elif [ -L "$1" ]; then
+        ln -s -- "$(readlink_ "$1")" "$pf_t" || return 1
+    elif [ -f "$2" ] && [ ! -L "$2" ] &&
+        cp -p -- "$2" "$pf_t" 2>/dev/null &&
+        cat -- "$1" >"$pf_t" 2>/dev/null; then
+        :
+    else
+        rm -f -- "$pf_t"
+        cp -- "$1" "$pf_t" || { rm -f -- "$pf_t" && return 1; }
+    fi
+    if [ -L "$2" ]; then rm -f -- "$2"; fi
+    mv -f -- "$pf_t" "$2" || { rm -f -- "$pf_t" && return 1; }
+}
+
+# repo_newer <src> <dst>: 0 if the repo copy is newer than the machine's
+repo_newer() {
+    rn_ref=$1
+    if is_git; then
+        rn_t=$(g log -1 --format=%cd --date=format:%Y%m%d%H%M.%S \
+            -- "$1" 2>/dev/null)
+        if [ -n "$rn_t" ] && touch -t "$rn_t" "$TMP/ref" 2>/dev/null; then
+            rn_ref=$TMP/ref
+        fi
+    fi
+    [ -z "$(find "$2" -prune -newer "$rn_ref" 2>/dev/null)" ]
+}
+
+review_one() { # review_one <rel> <src> -> RV_ACT=overwrite|keep|quit
+    while :; do
+        ask "  $1 differs: [o]verwrite, [k]eep yours, [d]iff," \
+            "[O]verwrite all, [K]eep all, [q]uit?" k
+        case $REPLY in
+        o) RV_ACT=overwrite && return 0 ;;
+        k) RV_ACT=keep && return 0 ;;
+        O) AP_STRAT=overwrite RV_ACT=overwrite && return 0 ;;
+        K) AP_STRAT=keep RV_ACT=keep && return 0 ;;
+        q) RV_ACT=quit && return 0 ;;
+        d) diff -u -- "$TARGET/$1" "$2" >/dev/tty 2>&1 ;;
+        esac
+    done
+}
+
+# apply_choose: pick a strategy for files that differ (asks if it can)
+apply_choose() {
+    [ "$ap_mod" -gt 0 ] && [ "$AP_STRAT" = ask ] || return 0
+    if [ "$HAVE_TTY" != 1 ] || [ "$OPT_YES" = 1 ] || [ "$OPT_DRY" = 1 ]; then
+        AP_STRAT=keep
+        note "keeping your versions of differing files" \
+            "(use --strategy overwrite|newer to replace them)"
+        return 0
+    fi
+    say "  These differ from the repo:"
+    head -n 15 "$TMP/ap.mod" | while IFS=$TAB read -r ac_rel ac_src; do
+        note "$ac_rel"
+    done
+    [ "$ap_mod" -gt 15 ] && note "... and $((ap_mod - 15)) more"
+    ask "How to handle them? [r]eview each, [o]verwrite all (backed up)," \
+        "[k]eep yours, [n]ewer wins, [q]uit" r
+    case $REPLY in
+    o | O) AP_STRAT=overwrite ;;
+    k | K) AP_STRAT=keep ;;
+    n | N) AP_STRAT=newer ;;
+    q | Q) AP_STRAT=quit ;;
+    *) AP_STRAT=review ;;
+    esac
+}
+
+# apply_dry: print what an apply would do
+apply_dry() {
+    while IFS=$TAB read -r ad_rel ad_src; do
+        ok "would create $ad_rel"
+    done <"$TMP/ap.new"
+    while IFS=$TAB read -r ad_rel ad_src; do
+        chg "would link $ad_rel"
+    done <"$TMP/ap.relink"
+    while IFS=$TAB read -r ad_rel ad_src; do
+        case $AP_STRAT in
+        keep | ask) note "would keep yours: $ad_rel" ;;
+        *) chg "would replace ($AP_STRAT): $ad_rel" ;;
+        esac
+    done <"$TMP/ap.mod"
+}
+
+# apply_files: install new files, relink, and handle the ones that differ
+apply_files() {
+    if [ "$ap_snap" = 1 ] || {
+        [ "$ap_snap" = auto ] && ! snapshot_any &&
+            [ -n "$(ls -A "$TARGET" 2>/dev/null)" ] &&
+            [ $((ap_new + ap_mod + ap_relink)) -gt 0 ]
+    }; then
+        snapshot_create before-first-apply
+    fi
+    bk_begin apply
+    while IFS=$TAB read -r af_rel af_src; do
+        put_file "$af_src" "$TARGET/$af_rel" "$(file_mode "$af_src")" &&
+            bk_create "$TARGET/$af_rel" && ok "$af_rel"
+    done <"$TMP/ap.new"
+    while IFS=$TAB read -r af_rel af_src; do
+        bk_modify "$TARGET/$af_rel" &&
+            put_file "$af_src" "$TARGET/$af_rel" link &&
+            chg "$af_rel  (now a link)"
+    done <"$TMP/ap.relink"
+    af_quit=0
+    while IFS=$TAB read -r af_rel af_src; do
+        [ "$af_quit" = 1 ] && break
+        case $AP_STRAT in
+        overwrite) af_act=overwrite ;;
+        keep) af_act=keep ;;
+        newer)
+            af_act=keep
+            repo_newer "$af_src" "$TARGET/$af_rel" && af_act=overwrite
+            ;;
+        *)
+            review_one "$af_rel" "$af_src" </dev/null
+            af_act=$RV_ACT
+            ;;
+        esac
+        case $af_act in
+        overwrite)
+            bk_modify "$TARGET/$af_rel" &&
+                put_file "$af_src" "$TARGET/$af_rel" \
+                    "$(file_mode "$af_src")" &&
+                chg "$af_rel"
+            ;;
+        keep) vrb "kept yours: $af_rel" ;;
+        quit) af_quit=1 ;;
+        esac
+    done <"$TMP/ap.mod"
+}
+
+cmd_apply() {
+    AP_MODE=${DOT_MODE:-copy} AP_STRAT=${DOT_STRATEGY:-ask}
+    ap_links=1 ap_plugins=1 ap_snap=auto
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --mode)
+            [ $# -ge 2 ] || die '--mode needs copy or link'
+            AP_MODE=$2
+            shift
+            ;;
+        --mode=*) AP_MODE=${1#--mode=} ;;
+        --link) AP_MODE=link ;;
+        --copy) AP_MODE=copy ;;
+        --strategy)
+            [ $# -ge 2 ] ||
+                die '--strategy needs ask, overwrite, keep or newer'
+            AP_STRAT=$2
+            shift
+            ;;
+        --strategy=*) AP_STRAT=${1#--strategy=} ;;
+        --overwrite | --keep | --newer | --review) AP_STRAT=${1#--} ;;
+        --secrets) AP_SECRETS=1 ;;
+        --no-links) ap_links=0 ;;
+        --no-plugins) ap_plugins=0 ;;
+        --snapshot) ap_snap=1 ;;
+        --no-snapshot) ap_snap=0 ;;
+        *) common_flag "$1" || die "apply: unknown option $1" ;;
+        esac
+        shift
+    done
+    [ "$AP_STRAT" = review ] && AP_STRAT=ask
+    case $AP_MODE in
+    copy | link) ;;
+    *) die "unknown mode '$AP_MODE' (copy or link)" ;;
+    esac
+    case $AP_STRAT in
+    ask | overwrite | keep | newer) ;;
+    *) die "unknown strategy '$AP_STRAT'" ;;
+    esac
+    require_repo
+    load_rules
+    [ "$OPT_DRY" = 1 ] || lock
+    run_hook pre-apply
+    apply_analyze
+    ap_new=$(count "$TMP/ap.new") ap_mod=$(count "$TMP/ap.mod")
+    ap_same=$(count "$TMP/ap.same") ap_relink=$(count "$TMP/ap.relink")
+    info "Applying $(pp "$DOT_ROOT") -> $(pp "$TARGET")  ($AP_MODE mode)"
+    ap_line="$ap_new new, $ap_mod differ, $ap_same identical"
+    [ "$ap_relink" -gt 0 ] &&
+        ap_line="$ap_line, $ap_relink to turn into links"
+    say "  $ap_line"
+    while IFS=$TAB read -r ap_rel ap_src; do
+        warn "skipping $ap_rel: you have a folder there"
+    done <"$TMP/ap.block"
+    apply_choose
+    if [ "$AP_STRAT" = quit ]; then
+        say 'Nothing changed.'
+        return 0
+    fi
+    if [ "$OPT_DRY" = 1 ]; then apply_dry; else apply_files; fi
+    [ "$ap_links" = 1 ] && links_apply
+    [ "$ap_plugins" = 1 ] && plugins_apply
+    if [ "$OPT_DRY" = 1 ]; then
+        note 'dry run: nothing was changed'
+        return 0
+    fi
+    bk_end
+    run_hook post-apply
+    return 0
+}
+
+# ---------------------------------------------------------------- home links
+
+# link_value <name-under-home> <target-under-config>: relative if possible
+link_value() {
+    case $TARGET in
+    "$HOME"/*) lv_base=${TARGET#"$HOME"/} ;;
+    *) printf '%s/%s\n' "$TARGET" "$2" && return 0 ;;
+    esac
+    lv_up='' lv_n=$1
+    while :; do
+        case $lv_n in
+        */*) lv_up="../$lv_up" lv_n=${lv_n#*/} ;;
+        *) break ;;
+        esac
+    done
+    printf '%s%s/%s\n' "$lv_up" "$lv_base" "$2"
+}
+cond_ok() {
+    case $1 in
+    '') return 0 ;;
+    os=*) [ "${1#os=}" = "$OS" ] || [ "${1#os=}" = "$DISTRO" ] ;;
+    host=*) [ "${1#host=}" = "$HOST" ] ;;
+    *) warn "dot.links: unknown condition '$1'" && return 1 ;;
+    esac
+}
+# link_opts <fields...>: the extra dot.links fields -> LO_MODE, LO_COND
+link_opts() {
+    LO_MODE=link LO_COND=''
+    for lo_w; do
+        case $lo_w in
+        source) LO_MODE=source ;;
+        os=* | host=*) LO_COND=$lo_w ;;
+        *) warn "dot.links: unknown field '$lo_w'" ;;
+        esac
+    done
+}
+# source_line <target-under-config>: the shell line that loads the target
+source_line() {
+    case $TARGET in
+    "$HOME"/*) sl_p="\$HOME/${TARGET#"$HOME"/}/$1" ;;
+    *) sl_p="$TARGET/$1" ;;
+    esac
+    printf '[ -r "%s" ] && . "%s"\n' "$sl_p" "$sl_p"
+}
+# loads_target <name> <target>: ~/<name> already loads (or is) the target
+loads_target() {
+    if [ -L "$HOME/$1" ]; then
+        [ "$(canon "$HOME/$1")" = "$(canon "$TARGET/$2")" ]
+        return
+    fi
+    [ -f "$HOME/$1" ] &&
+        grep -q -x -F -- "$(source_line "$2")" "$HOME/$1"
+}
+# rc_append <name> <comment> <line...>: append lines to ~/<name>, backed up
+rc_append() {
+    ra_f=$HOME/$1 ra_c=$2
+    shift 2
+    if [ "$OPT_DRY" = 1 ]; then
+        chg "would add a line to ~/${ra_f##*/}: $ra_c"
+        return 0
+    fi
+    bk_modify "$ra_f" || return 1
+    printf '\n# added by dot: %s\n' "$ra_c" >>"$ra_f"
+    printf '%s\n' "$@" >>"$ra_f"
+    chg "~/${ra_f##*/}: $ra_c (your lines kept)"
+}
+# rc_create <name> <comment> <line...>: create ~/<name> holding the lines
+rc_create() {
+    rn_f=$HOME/$1 rn_c=$2
+    shift 2
+    if [ "$OPT_DRY" = 1 ]; then
+        ok "would create ~/${rn_f##*/}: $rn_c"
+        return 0
+    fi
+    printf '# added by dot: %s\n' "$rn_c" >"$rn_f" &&
+        printf '%s\n' "$@" >>"$rn_f" || return 1
+    bk_create "$rn_f"
+    ok "~/${rn_f##*/} created: $rn_c"
+}
+# bash_login_ensure: bash login shells (ssh, macOS Terminal) read
+# ~/.bash_profile, ~/.bash_login or ~/.profile instead of ~/.bashrc.
+# Make the one bash actually reads load ~/.bashrc, never shadowing an
+# existing ~/.profile with a new ~/.bash_profile.
+bash_login_ensure() {
+    be_c='bash login shells load ~/.bashrc'
+    be_l='[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"'
+    for be_f in .bash_profile .bash_login; do
+        [ -f "$HOME/$be_f" ] || continue
+        grep -q 'bashrc' "$HOME/$be_f" && return 0
+        rc_append "$be_f" "$be_c" "$be_l"
+        return
+    done
+    if [ -f "$HOME/.profile" ]; then
+        grep -q 'bashrc' "$HOME/.profile" && return 0
+        rc_append .profile "$be_c" \
+            'if [ -n "${BASH_VERSION:-}" ] && [ -r "$HOME/.bashrc" ]; then' \
+            '    . "$HOME/.bashrc"' 'fi'
+        return
+    fi
+    rc_create .bash_profile "$be_c" "$be_l"
+}
+# source_choice <name> <is-link>: what to do with an existing ~/<name>
+#   -> SC_ACT=source|replace|keep
+source_choice() {
+    SC_ACT=source
+    [ "$2" = 1 ] && SC_ACT=keep
+    case $AP_STRAT in
+    keep) SC_ACT=keep ;;
+    ask | review)
+        [ "$HAVE_TTY" = 1 ] && [ "$OPT_DRY" != 1 ] || return 0
+        if [ "$2" = 1 ]; then
+            ask "  ~/$1 is a link elsewhere. [r]eplace it with a link" \
+                "(backed up) or [k]eep it?" k </dev/null
+        else
+            ask "  ~/$1 exists. [s]ource: keep yours and add one line" \
+                "(recommended), [r]eplace it with a link (backed up)," \
+                "[k]eep it?" s </dev/null
+        fi
+        case $REPLY in
+        r | R) SC_ACT=replace ;;
+        k | K) SC_ACT=keep ;;
+        *) if [ "$2" = 1 ]; then SC_ACT=keep; else SC_ACT=source; fi ;;
+        esac
+        ;;
+    esac
+}
+# link_source <name> <target>: make ~/<name> load the target, keeping the
+# lines already in it (the "source" mode of dot.links)
+link_source() {
+    ls_dst=$HOME/$1
+    if [ ! -f "$TARGET/$2" ]; then
+        note "~/$1: $2 is not in ~/.config, skipped"
+        return 0
+    fi
+    ls_c="load $2 from ~/.config"
+    ls_val=$(link_value "$1" "$2")
+    if loads_target "$1" "$2"; then
+        vrb "~/$1 ok"
+    elif ! exists "$ls_dst"; then
+        # nothing to keep (a new Mac has no ~/.zshrc): a plain symlink
+        if [ "$OPT_DRY" = 1 ]; then
+            ok "would link ~/$1 -> $ls_val"
+        else
+            ln -s -- "$ls_val" "$ls_dst" && bk_create "$ls_dst" &&
+                ok "~/$1 -> $ls_val"
+        fi
+    elif [ -d "$ls_dst" ] && [ ! -L "$ls_dst" ]; then
+        warn "~/$1 is a folder; skipped"
+        return 0
+    else
+        ls_link=0
+        [ -L "$ls_dst" ] && ls_link=1
+        source_choice "$1" "$ls_link"
+        case $SC_ACT in
+        keep)
+            note "~/$1 kept as it is (it does not load $2)"
+            return 0
+            ;;
+        source) rc_append "$1" "$ls_c" "$(source_line "$2")" || return 0 ;;
+        replace)
+            if [ "$OPT_DRY" = 1 ]; then
+                chg "would replace ~/$1 -> $ls_val"
+            else
+                bk_modify "$ls_dst" || return 0
+                rm -f -- "$ls_dst"
+                ln -s -- "$ls_val" "$ls_dst" && bk_create "$ls_dst" &&
+                    ok "~/$1 -> $ls_val"
+            fi
+            ;;
+        esac
+    fi
+    [ "$1" = .bashrc ] && bash_login_ensure
+    return 0
+}
+# link_replace_ok <name> <value>: may ~/<name> be replaced by a link?
+link_replace_ok() {
+    lr_act=$AP_STRAT
+    if [ "$lr_act" = ask ] || [ "$lr_act" = review ]; then
+        lr_act=keep
+        if [ "$HAVE_TTY" = 1 ] && [ "$OPT_DRY" != 1 ] &&
+            confirm "  ~/$1 exists. Replace it with a link to $2" \
+                "(backed up)?" y </dev/null; then
+            lr_act=overwrite
+        fi
+    fi
+    [ "$lr_act" = overwrite ]
+}
+links_apply() {
+    [ -f "$DOT_ROOT/dot.links" ] || return 0
+    strip_comments "$DOT_ROOT/dot.links" >"$TMP/links"
+    [ -s "$TMP/links" ] || return 0
+    info 'Home links'
+    while read -r la_name la_tgt la_rest; do
+        link_opts $la_rest
+        cond_ok "$LO_COND" || continue
+        if [ "$LO_MODE" = source ]; then
+            link_source "$la_name" "$la_tgt"
+            continue
+        fi
+        la_dir=0
+        case $la_tgt in */) la_dir=1 la_tgt=${la_tgt%/} ;; esac
+        la_want=$TARGET/$la_tgt la_dst=$HOME/$la_name
+        if [ ! -e "$la_want" ]; then
+            if [ "$la_dir" != 1 ]; then
+                note "~/$la_name: $la_tgt is not in ~/.config, skipped"
+                continue
+            fi
+            if [ "$OPT_DRY" = 1 ]; then
+                note "would create folder $(pp "$la_want")"
+            else
+                (umask 077 && mkdir -p -- "$la_want") &&
+                    bk_create "$la_want"
+            fi
+        fi
+        if [ -L "$la_dst" ] &&
+            [ "$(canon "$la_dst")" = "$(canon "$la_want")" ]; then
+            vrb "~/$la_name ok"
+            continue
+        fi
+        la_val=$(link_value "$la_name" "$la_tgt")
+        if exists "$la_dst"; then
+            if ! link_replace_ok "$la_name" "$la_val"; then
+                note "~/$la_name exists, kept" \
+                    "(use --strategy overwrite to replace)"
+                continue
+            fi
+            if [ "$OPT_DRY" = 1 ]; then
+                chg "would replace ~/$la_name -> $la_val"
+                continue
+            fi
+            bk_modify "$la_dst" || continue
+            rm -rf -- "$la_dst"
+        elif [ "$OPT_DRY" = 1 ]; then
+            ok "would link ~/$la_name -> $la_val"
+            continue
+        fi
+        mkdir -p -- "${la_dst%/*}"
+        if ln -s -- "$la_val" "$la_dst"; then
+            bk_create "$la_dst"
+            ok "~/$la_name -> $la_val"
+        fi
+    done <"$TMP/links"
+}
+cmd_link() {
+    AP_STRAT=${DOT_STRATEGY:-ask}
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --overwrite | --keep) AP_STRAT=${1#--} ;;
+        *) common_flag "$1" || die "link: unknown option $1" ;;
+        esac
+        shift
+    done
+    require_repo
+    [ "$OPT_DRY" = 1 ] || lock
+    bk_begin link
+    links_apply
+    [ "$OPT_DRY" = 1 ] || bk_end
+}
+
+# adopt_dest <name-without-dot>: a sensible home in ~/.config for ~/.name
+adopt_dest() {
+    case $1 in
+    zshrc | zshenv | zprofile | zlogin | zlogout) printf 'zsh/%s' "$1" ;;
+    bashrc | bash_profile | bash_logout | bash_aliases)
+        printf 'bash/%s' "$1"
+        ;;
+    profile) printf 'sh/profile' ;;
+    vimrc) printf 'vim/vimrc' ;;
+    gvimrc) printf 'vim/gvimrc' ;;
+    gitconfig) printf 'git/config' ;;
+    gitignore_global | gitignore) printf 'git/ignore' ;;
+    tmux.conf) printf 'tmux/tmux.conf' ;;
+    inputrc) printf 'readline/inputrc' ;;
+    *rc) printf '%s/%s' "${1%rc}" "$1" ;;
+    *) printf '%s/%s' "$1" "$1" ;;
+    esac
+}
+# adopt_one <abs-path> <rel-in-config|empty>
+adopt_one() {
+    ao_f=$1
+    ao_name=${ao_f##*/}
+    if [ "$ao_f" != "$HOME/$ao_name" ]; then
+        warn "$ao_f: only files directly in your home folder can be adopted"
+        return 0
+    fi
+    if [ -L "$ao_f" ]; then note "~/$ao_name is already a link" && return 0; fi
+    [ -e "$ao_f" ] || { warn "~/$ao_name does not exist" && return 0; }
+    ao_rel=${2:-$(adopt_dest "${ao_name#.}")}
+    ao_dst=$TARGET/$ao_rel
+    if exists "$ao_dst"; then
+        warn "$(pp "$ao_dst") already exists; choose another place with --as"
+        return 0
+    fi
+    if [ "$OPT_DRY" = 1 ]; then
+        ok "would move ~/$ao_name to $(pp "$ao_dst") and link it back"
+        return 0
+    fi
+    mkdir -p -- "${ao_dst%/*}" || return 0
+    bk_modify "$ao_f" || return 0
+    cp -RPp -- "$ao_f" "$ao_dst" ||
+        { warn "copy failed for ~/$ao_name" && return 0; }
+    bk_create "$ao_dst"
+    rm -rf -- "$ao_f"
+    ln -s -- "$(link_value "$ao_name" "$ao_rel")" "$ao_f"
+    [ -d "$ao_dst" ] && ao_rel=$ao_rel/
+    [ -f "$DOT_ROOT/dot.links" ] || links_header >"$DOT_ROOT/dot.links"
+    if ! has_entry "$ao_name" "$DOT_ROOT/dot.links"; then
+        printf '%-20s %s\n' "$ao_name" "$ao_rel" >>"$DOT_ROOT/dot.links"
+    fi
+    ok "~/$ao_name -> $(pp "$ao_dst")  (recorded in dot.links)"
+}
+cmd_adopt() {
+    ad_files='' ad_to=''
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --as)
+            [ $# -ge 2 ] || die '--as needs a path under ~/.config'
+            ad_to=$2
+            shift
+            ;;
+        -*) common_flag "$1" || die "adopt: unknown option $1" ;;
+        *) ad_files="$ad_files$1$NL" ;;
+        esac
+        shift
+    done
+    [ -n "$ad_files" ] || die 'usage: dot adopt ~/.file [--as dir/file] ...'
+    require_repo
+    [ "$OPT_DRY" = 1 ] || lock
+    bk_begin adopt
+    printf '%s' "$ad_files" >"$TMP/adopt"
+    while IFS= read -r ad_f; do
+        case $ad_f in /*) ;; *) ad_f=$PWD/$ad_f ;; esac
+        adopt_one "$ad_f" "$ad_to"
+    done <"$TMP/adopt"
+    [ "$OPT_DRY" = 1 ] || bk_end
+}
+
+# ------------------------------------------------------------------- plugins
+
+plugins_apply() {
+    [ -f "$DOT_ROOT/dot.plugins" ] || return 0
+    strip_comments "$DOT_ROOT/dot.plugins" >"$TMP/plugins"
+    [ -s "$TMP/plugins" ] || return 0
+    command -v git >/dev/null 2>&1 ||
+        { warn 'git is missing: plugins not installed' && return 0; }
+    while read -r pa_path pa_url pa_ref; do
+        pa_dst=$TARGET/$pa_path
+        if [ -e "$pa_dst" ]; then
+            vrb "plugin present: $pa_path"
+            continue
+        fi
+        if [ "$OPT_DRY" = 1 ]; then
+            ok "would clone $pa_url -> $pa_path"
+            continue
+        fi
+        mkdir -p -- "${pa_dst%/*}"
+        case ${pa_ref:-HEAD} in
+        HEAD) git clone -q --depth 1 -- "$pa_url" "$pa_dst" ;;
+        *[!0-9a-f]* | ?????????????????????????????????????????*)
+            # a branch or tag name, not a commit id
+            git clone -q --depth 1 --branch "$pa_ref" -- "$pa_url" "$pa_dst"
+            ;;
+        *)
+            git clone -q -- "$pa_url" "$pa_dst" &&
+                git -C "$pa_dst" checkout -q "$pa_ref"
+            ;;
+        esac
+        if [ -d "$pa_dst/.git" ]; then
+            bk_create "$pa_dst"
+            ok "plugin $pa_path"
+        else
+            warn "could not clone $pa_url"
+        fi
+    done <"$TMP/plugins"
+}
+cmd_plugins() {
+    pl_sub=${1:-list}
+    [ $# -gt 0 ] && shift
+    for pl_a; do
+        common_flag "$pl_a" || die "plugins: unknown option $pl_a"
+    done
+    require_repo
+    if [ ! -f "$DOT_ROOT/dot.plugins" ]; then
+        say 'No plugins recorded' \
+            '(dot capture records git clones it finds in ~/.config).'
+        return 0
+    fi
+    strip_comments "$DOT_ROOT/dot.plugins" >"$TMP/plugins"
+    case $pl_sub in
+    list)
+        while read -r pl_p pl_u pl_r; do
+            if [ -d "$TARGET/$pl_p" ]; then
+                ok "$pl_p  ($pl_r)  $pl_u"
+            else
+                bad "$pl_p  (missing)  $pl_u"
+            fi
+        done <"$TMP/plugins"
+        ;;
+    install)
+        [ "$OPT_DRY" = 1 ] || lock
+        bk_begin plugins
+        plugins_apply
+        [ "$OPT_DRY" = 1 ] || bk_end
+        ;;
+    update)
+        need git
+        while read -r pl_p pl_u pl_r; do
+            [ -d "$TARGET/$pl_p/.git" ] || continue
+            if [ "$OPT_DRY" = 1 ]; then
+                note "would update $pl_p"
+            elif git -C "$TARGET/$pl_p" pull -q --ff-only 2>/dev/null; then
+                ok "$pl_p"
+            else
+                warn "$pl_p: update failed (pinned commit or local changes?)"
+            fi
+        done <"$TMP/plugins"
+        ;;
+    *) die "usage: dot plugins [list|install|update]" ;;
+    esac
+}
+
+# ------------------------------------------------- secrets (opt-in, --secrets)
+#
+# Files listed in dot.secrets are never copied in plain text. With
+# --secrets they are stored encrypted in secrets/<path>.enc: with age when
+# the key is an age identity (authenticated encryption), otherwise with
+# openssl (AES-256-CBC, PBKDF2-SHA256, plus a keyed SHA-256 integrity
+# check). The key lives outside the repo and is never committed.
+
+SECRET_HDR='dot-secret v1 openssl aes-256-cbc pbkdf2-sha256 200000'
+
+key_file() {
+    printf '%s' "${DOT_KEY:-${XDG_DATA_HOME:-$HOME/.local/share}/dot/key}"
+}
+# crypt_backend: age (the key is an age identity) or openssl
+crypt_backend() {
+    if grep -q '^AGE-SECRET-KEY-' "$(key_file)" 2>/dev/null; then
+        echo age
+    else
+        echo openssl
+    fi
+}
+# crypt_ready: a key (or DOT_PASSPHRASE) and the tool it needs are there
+crypt_ready() {
+    if [ ! -f "$(key_file)" ] && [ -z "${DOT_PASSPHRASE:-}" ]; then
+        warn "no key at $(pp "$(key_file)"): run 'dot secret init'," \
+            "copy your key there, or set DOT_PASSPHRASE"
+        return 1
+    fi
+    case $(crypt_backend) in
+    age)
+        have age && have age-keygen && return 0
+        warn 'the key is an age key, but age is not installed'
+        ;;
+    openssl)
+        have openssl && return 0
+        warn 'openssl is not installed'
+        ;;
+    esac
+    return 1
+}
+key_material() {
+    if [ -f "$(key_file)" ]; then
+        cat -- "$(key_file)"
+    else
+        printf '%s' "$DOT_PASSPHRASE"
+    fi
+}
+# ossl <args...>: openssl enc with dot's settings; the key never on argv
+ossl() {
+    if [ -f "$(key_file)" ]; then
+        set -- -pass "file:$(key_file)" "$@"
+    else
+        set -- -pass env:DOT_PASSPHRASE "$@"
+    fi
+    openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 "$@"
+}
+# secret_mac <file>: keyed SHA-256 of a file: sha256(key | file | key)
+secret_mac() {
+    {
+        key_material
+        cat -- "$1"
+        key_material
+    } | openssl dgst -sha256 | sed 's/^.*= *//'
+}
+# secret_kind <file>: age, openssl or none, from the first line
+secret_kind() {
+    case $(sed -n 1p "$1" 2>/dev/null) in
+    '-----BEGIN AGE ENCRYPTED FILE-----') echo age ;;
+    "$SECRET_HDR") echo openssl ;;
+    *) echo none ;;
+    esac
+}
+# secret_encrypt <plain> <out>: write a text-safe encrypted copy
+secret_encrypt() {
+    se_t=$TMP/enc.$$
+    case $(crypt_backend) in
+    age)
+        se_r=$(age-keygen -y "$(key_file)") || return 1
+        age -e -a -r "$se_r" -o "$se_t" "$1" || return 1
+        ;;
+    openssl)
+        ossl -salt -a -in "$1" -out "$se_t.ct" || return 1
+        {
+            printf '%s\n' "$SECRET_HDR"
+            printf 'mac %s\n' "$(secret_mac "$se_t.ct")"
+            cat -- "$se_t.ct"
+        } >"$se_t" || return 1
+        rm -f -- "$se_t.ct"
+        ;;
+    esac
+    mkdir -p -- "${2%/*}" && mv -f -- "$se_t" "$2"
+}
+# secret_decrypt <enc> <out>: decrypt to <out> (mode 600), checking the
+# integrity first. 1: cannot decrypt, 2: wrong key or changed, 3: not ours
+secret_decrypt() {
+    case $(secret_kind "$1") in
+    age)
+        [ -f "$(key_file)" ] || return 1
+        (umask 077 && age -d -i "$(key_file)" -o "$2" "$1") 2>/dev/null ||
+            return 2
+        ;;
+    openssl)
+        sd_t=$TMP/dec.$$
+        tail -n +3 "$1" >"$sd_t"
+        if [ "$(secret_mac "$sd_t")" != "$(sed -n '2s/^mac //p' "$1")" ]
+        then
+            rm -f -- "$sd_t"
+            return 2
+        fi
+        (umask 077 && ossl -d -a -in "$sd_t" -out "$2") 2>/dev/null
+        sd_rc=$?
+        rm -f -- "$sd_t"
+        [ "$sd_rc" = 0 ] || return 2
+        ;;
+    *) return 3 ;;
+    esac
+}
+secret_list() {
+    [ -n "$DOT_ROOT" ] && [ -f "$DOT_ROOT/dot.secrets" ] &&
+        strip_comments "$DOT_ROOT/dot.secrets"
+}
+is_secret() {
+    case $NL$SECRET_RELS$NL in *"$NL$1$NL"*) return 0 ;; esac
+    return 1
+}
+# secrets_capture: encrypt the listed files that changed (capture --secrets)
+secrets_capture() {
+    [ -n "$SECRET_RELS" ] || return 0
+    crypt_ready || return 1
+    say "${C_B}Encrypted secrets${C_0} ($(crypt_backend)):"
+    printf '%s\n' "$SECRET_RELS" >"$TMP/sec.list"
+    while IFS= read -r sx_r; do
+        sx_src=$TARGET/$sx_r sx_enc=$DOT_ROOT/secrets/$sx_r.enc
+        if [ ! -f "$sx_src" ]; then
+            note "$sx_r  (not on this machine)"
+            continue
+        fi
+        rm -f -- "$TMP/sec.cmp"
+        if [ -f "$sx_enc" ] && secret_decrypt "$sx_enc" "$TMP/sec.cmp" &&
+            cmp -s -- "$sx_src" "$TMP/sec.cmp"; then
+            vrb "$sx_r  (unchanged)"
+            continue
+        fi
+        if [ "$OPT_DRY" = 1 ]; then
+            chg "would encrypt $sx_r"
+        elif secret_encrypt "$sx_src" "$sx_enc"; then
+            ok "$sx_r  (encrypted)"
+        else
+            warn "could not encrypt $sx_r"
+        fi
+    done <"$TMP/sec.list"
+    rm -f -- "$TMP/sec.cmp"
+}
+# secrets_effective: decrypt secrets/ into the private temp folder and
+# print "rel<TAB>file" lines for apply (apply --secrets)
+secrets_effective() {
+    [ -d "$DOT_ROOT/secrets" ] || return 0
+    crypt_ready || return 0
+    (cd "$DOT_ROOT/secrets" && find . -type f -name '*.enc' -print) |
+        sed 's#^\./##' | while IFS= read -r xe_f; do
+        xe_r=${xe_f%.enc} xe_o=$TMP/sec/${xe_f%.enc}
+        (umask 077 && mkdir -p -- "${xe_o%/*}")
+        if secret_decrypt "$DOT_ROOT/secrets/$xe_f" "$xe_o"; then
+            printf '%s\t%s\n' "$xe_r" "$xe_o"
+        else
+            warn "cannot decrypt secrets/$xe_f" \
+                "(wrong key, or the file was changed); skipped"
+        fi
+    done
+}
+# secret_rel <path>: a path relative to ~/.config
+secret_rel() {
+    case $1 in
+    "$TARGET"/*) printf '%s' "${1#"$TARGET"/}" ;;
+    "$TARGET_REAL"/*) printf '%s' "${1#"$TARGET_REAL"/}" ;;
+    *) printf '%s' "$1" ;;
+    esac
+}
+secret_init() {
+    si_k=$(key_file) si_b=${1:-}
+    if [ -f "$si_k" ]; then
+        note "a key already exists: $(pp "$si_k") ($(crypt_backend))"
+        return 0
+    fi
+    if [ -z "$si_b" ]; then
+        si_b=openssl
+        have age-keygen && si_b=age
+    fi
+    (umask 077 && mkdir -p -- "${si_k%/*}") || die "cannot create ${si_k%/*}"
+    case $si_b in
+    age)
+        have age-keygen || die 'age is not installed'
+        (umask 077 && age-keygen -o "$si_k" 2>/dev/null) ||
+            die 'age-keygen failed'
+        ;;
+    openssl)
+        have openssl || die 'openssl is not installed'
+        (umask 077 && openssl rand -base64 48 >"$si_k") ||
+            die 'openssl rand failed'
+        ;;
+    *) die "unknown backend '$si_b' (age or openssl)" ;;
+    esac
+    ok "new $si_b key: $(pp "$si_k")"
+    say "Keep a copy somewhere safe (a password manager is ideal)." \
+        "Without it the encrypted files cannot be read. On another" \
+        "machine, put it at the same path (or point DOT_KEY at it)."
+}
+secret_add() {
+    [ $# -gt 0 ] || die 'usage: dot secret add <path in ~/.config>...'
+    sa_f=$DOT_ROOT/dot.secrets
+    for sa_p; do
+        sa_r=$(secret_rel "$sa_p")
+        if [ ! -f "$TARGET/$sa_r" ]; then
+            warn "$sa_r: no such file in $(pp "$TARGET")"
+            continue
+        fi
+        [ -f "$sa_f" ] || printf '%s\n' \
+            '# Files stored encrypted in secrets/ by "dot capture --secrets"' \
+            '# and restored by "dot apply --secrets". One path a line.' \
+            >"$sa_f"
+        if grep -q -x -F -- "$sa_r" "$sa_f"; then
+            note "already listed: $sa_r"
+        else
+            printf '%s\n' "$sa_r" >>"$sa_f"
+            ok "listed: $sa_r"
+        fi
+        if [ -e "$DOT_ROOT/config/$sa_r" ]; then
+            rm -f -- "$DOT_ROOT/config/$sa_r"
+            note "removed the plain copy from config/ (history keeps it:" \
+                "rotate that secret if the repo was ever pushed)"
+        fi
+    done
+    load_rules
+    secrets_capture
+}
+secret_remove() {
+    [ $# -gt 0 ] || die 'usage: dot secret rm <path in ~/.config>...'
+    sr_f=$DOT_ROOT/dot.secrets
+    [ -f "$sr_f" ] || die 'no dot.secrets yet'
+    for sr_p; do
+        sr_r=$(secret_rel "$sr_p")
+        grep -v -x -F -- "$sr_r" "$sr_f" >"$TMP/secrets.new"
+        cat "$TMP/secrets.new" >"$sr_f"
+        rm -f -- "$DOT_ROOT/secrets/$sr_r.enc"
+        ok "no longer stored: $sr_r (git history keeps the encrypted copy)"
+    done
+}
+secret_status() {
+    say "${C_B}Key${C_0}: $(pp "$(key_file)")" \
+        "($(crypt_backend))$([ -f "$(key_file)" ] || echo ', missing')"
+    if [ -z "$SECRET_RELS" ]; then
+        note 'no secrets listed (dot secret add <path>)'
+        return 0
+    fi
+    printf '%s\n' "$SECRET_RELS" >"$TMP/sec.list"
+    while IFS= read -r st_r; do
+        st_e=$DOT_ROOT/secrets/$st_r.enc
+        if [ ! -f "$st_e" ]; then
+            bad "$st_r  (not encrypted yet: dot capture --secrets)"
+        elif ! secret_decrypt "$st_e" "$TMP/sec.cmp"; then
+            bad "$st_r  (cannot decrypt with this key)"
+        elif [ ! -f "$TARGET/$st_r" ]; then
+            note "$st_r  (encrypted; not on this machine)"
+        elif cmp -s -- "$TARGET/$st_r" "$TMP/sec.cmp"; then
+            ok "$st_r  (encrypted, up to date)"
+        else
+            chg "$st_r  (changed here: dot capture --secrets)"
+        fi
+        rm -f -- "$TMP/sec.cmp"
+    done <"$TMP/sec.list"
+}
+cmd_secret() {
+    sx_sub=${1:-list}
+    [ $# -gt 0 ] && shift
+    sx_backend=''
+    sx_args=''
+    for sx_a; do
+        case $sx_a in
+        --age) sx_backend=age ;;
+        --openssl) sx_backend=openssl ;;
+        -*) common_flag "$sx_a" || die "secret: unknown option $sx_a" ;;
+        *) sx_args="$sx_args$sx_a$NL" ;;
+        esac
+    done
+    [ "$sx_sub" = init ] || require_repo
+    load_rules
+    TARGET_REAL=$(canon "$TARGET")
+    printf '%s' "$sx_args" >"$TMP/sx.args"
+    set --
+    while IFS= read -r sx_a; do set -- "$@" "$sx_a"; done <"$TMP/sx.args"
+    case $sx_sub in
+    init) secret_init "$sx_backend" ;;
+    add)
+        [ "$OPT_DRY" = 1 ] || lock
+        secret_add "$@"
+        ;;
+    rm | remove) secret_remove "$@" ;;
+    list | status) secret_status ;;
+    *) die 'usage: dot secret [init|add|rm|list] [path...]' ;;
+    esac
+}
+
+# ---------------------------------------------------------------- templates
+#
+# A repo file named <name>.tmpl is rendered into ~/.config/<name> on apply:
+#   {{host}} {{os}} {{distro}} {{arch}} {{user}} {{home}} {{config}}
+#   {{name}}       a value from dot.vars ("name = value"; [os=..] sections)
+#   {{env:NAME}}   an environment variable
+#   {{if os=darwin}} ... {{else}} ... {{end}}   on lines of their own
+#                  (also host=, name!=value, or just a name: "is set")
+
+tpl_builtin() {
+    printf 'os\t%s\n' "$OS"
+    printf 'distro\t%s\n' "${DISTRO:-$OS}"
+    printf 'host\t%s\n' "$HOST"
+    printf 'user\t%s\n' "$(id -un 2>/dev/null)"
+    printf 'home\t%s\n' "$HOME"
+    printf 'arch\t%s\n' "$(uname -m 2>/dev/null)"
+    printf 'config\t%s\n' "$TARGET"
+}
+tpl_awk() {
+    cat <<'EOF'
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function holds(e,   p, k, v) {
+    e = trim(e)
+    if ((p = index(e, "!=")) > 0) {
+        k = trim(substr(e, 1, p - 1)); v = trim(substr(e, p + 2))
+        return !(k in var) || var[k] != v
+    }
+    if ((p = index(e, "=")) > 0) {
+        k = trim(substr(e, 1, p - 1)); v = trim(substr(e, p + 1))
+        return (k in var) && var[k] == v
+    }
+    return (e in var) && var[e] != ""
+}
+function fail(msg) {
+    printf "%s:%d: %s\n", FILENAME, FNR, msg > "/dev/stderr"; bad = 1
+}
+BEGIN { active = 1 }
+FILENAME == B { p = index($0, "\t"); var[substr($0, 1, p - 1)] = \
+    substr($0, p + 1); next }
+FILENAME == V {
+    line = trim($0)
+    if (line == "" || line ~ /^#/) next
+    if (line ~ /^\[.*\]$/) {
+        active = holds(substr(line, 2, length(line) - 2)); next
+    }
+    if (active && (p = index(line, "=")) > 0)
+        var[trim(substr(line, 1, p - 1))] = trim(substr(line, p + 1))
+    next
+}
+DUMP { next }
+/^[ \t]*\{\{[ \t]*if[ \t].*\}\}[ \t]*$/ {
+    e = $0; sub(/^[ \t]*\{\{[ \t]*if[ \t]+/, "", e)
+    sub(/[ \t]*\}\}[ \t]*$/, "", e); cond[++depth] = holds(e); next
+}
+/^[ \t]*\{\{[ \t]*else[ \t]*\}\}[ \t]*$/ {
+    if (depth) cond[depth] = !cond[depth]; else fail("else without if")
+    next
+}
+/^[ \t]*\{\{[ \t]*end[ \t]*\}\}[ \t]*$/ {
+    if (depth) depth--; else fail("end without if")
+    next
+}
+{
+    for (i = 1; i <= depth; i++) if (!cond[i]) next
+    line = $0; out = ""
+    while (match(line, /\{\{[ \t]*[A-Za-z_][A-Za-z0-9_:]*[ \t]*\}\}/)) {
+        name = trim(substr(line, RSTART + 2, RLENGTH - 4))
+        if (name ~ /^env:/) val = ENVIRON[substr(name, 5)]
+        else if (name in var) val = var[name]
+        else { fail("unknown variable {{" name "}}"); val = "" }
+        out = out substr(line, 1, RSTART - 1) val
+        line = substr(line, RSTART + RLENGTH)
+    }
+    print out line
+}
+END {
+    if (DUMP) for (k in var) printf "%s = %s\n", k, var[k]
+    if (depth) { printf "%s: {{if}} without {{end}}\n", FILENAME \
+        > "/dev/stderr"; bad = 1 }
+    exit bad
+}
+EOF
+}
+# render <template> <out>: render one template; non-zero on any error
+render() {
+    tpl_builtin >"$TMP/vars.builtin"
+    rd_v=/dev/null
+    [ -f "$DOT_ROOT/dot.vars" ] && rd_v=$DOT_ROOT/dot.vars
+    awk -v B="$TMP/vars.builtin" -v V="$rd_v" -v DUMP=0 "$(tpl_awk)" \
+        "$TMP/vars.builtin" "$rd_v" "$1" >"$2"
+}
+# tpl_source <rel>: the template that produces ~/.config/<rel> -> $TS_PATH
+tpl_source() {
+    TS_PATH=''
+    for ts_d in config $OVERLAYS; do
+        [ -f "$DOT_ROOT/$ts_d/$1.tmpl" ] && TS_PATH=$DOT_ROOT/$ts_d/$1.tmpl
+    done
+    [ -n "$TS_PATH" ]
+}
+cmd_vars() {
+    require_repo
+    tpl_builtin >"$TMP/vars.builtin"
+    cv_v=/dev/null
+    [ -f "$DOT_ROOT/dot.vars" ] && cv_v=$DOT_ROOT/dot.vars
+    awk -v B="$TMP/vars.builtin" -v V="$cv_v" -v DUMP=1 "$(tpl_awk)" \
+        "$TMP/vars.builtin" "$cv_v" /dev/null | LC_ALL=C sort
+}
+cmd_render() {
+    [ $# -gt 0 ] || die 'usage: dot render <path in ~/.config>'
+    require_repo
+    TARGET_REAL=$(canon "$TARGET")
+    for cr_p; do
+        cr_r=$(secret_rel "$cr_p")
+        cr_r=${cr_r%.tmpl}
+        tpl_source "$cr_r" || die "no template for $cr_r"
+        render "$TS_PATH" "$TMP/render.out" || die "cannot render $cr_r"
+        cat "$TMP/render.out"
+    done
+}
+cmd_template() {
+    [ $# -gt 0 ] || die 'usage: dot template <path in ~/.config>...'
+    require_repo
+    TARGET_REAL=$(canon "$TARGET")
+    for ct_p; do
+        ct_r=$(secret_rel "$ct_p")
+        if tpl_source "$ct_r"; then
+            note "$ct_r is already a template: $(pp "$TS_PATH")"
+            continue
+        fi
+        capture_dest "$ct_r"
+        if [ ! -f "$CD_PATH" ]; then
+            warn "$ct_r is not in the repo yet (dot capture first)"
+            continue
+        fi
+        if [ "$OPT_DRY" = 1 ]; then
+            ok "would turn $(pp "$CD_PATH") into a template"
+            continue
+        fi
+        mv -f -- "$CD_PATH" "$CD_PATH.tmpl"
+        ok "$(pp "$CD_PATH.tmpl")  (edit it; {{host}}, {{if os=..}} etc.)"
+    done
+}
+
+# ---------------------------------------------- backups, rollback, snapshots
+
+bk_begin() {
+    BK_ID=$(date +%Y%m%d-%H%M%S)-$1
+    BK_DIR=$STATE/backups/$BK_ID
+    bk_i=1
+    while [ -e "$BK_DIR" ]; do
+        bk_i=$((bk_i + 1))
+        BK_DIR=$STATE/backups/$BK_ID-$bk_i
+    done
+    BK_ID=${BK_DIR##*/}
+    BK_N=0
+}
+bk_open() {
+    [ -f "$BK_DIR/manifest" ] && return 0
+    (umask 077 && mkdir -p -- "$BK_DIR/files") ||
+        die "cannot create backup folder $BK_DIR"
+    {
+        printf 'command: %s\n' "${BK_ID#*-*-}"
+        printf 'date: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+        printf 'host: %s\n' "$HOST"
+        printf 'target: %s\n' "$TARGET"
+    } >"$BK_DIR/info"
+    : >"$BK_DIR/manifest"
+}
+# bk_modify <abs>: keep the current version of <abs> before it is replaced
+bk_modify() {
+    bk_open
+    BK_N=$((BK_N + 1))
+    cp -RPp -- "$1" "$BK_DIR/files/$BK_N" 2>/dev/null ||
+        cp -RP -- "$1" "$BK_DIR/files/$BK_N" || {
+        warn "backup of $(pp "$1") failed; leaving it alone"
+        return 1
+    }
+    printf 'M\t%s\t%s\n' "$BK_N" "$1" >>"$BK_DIR/manifest"
+}
+# bk_create <abs>: remember that <abs> did not exist before
+bk_create() {
+    bk_open
+    printf 'C\t-\t%s\n' "$1" >>"$BK_DIR/manifest"
+}
+bk_end() {
+    if [ -s "$BK_DIR/manifest" ]; then
+        printf '%s\n' "$BK_ID" >"$STATE/backups/.latest"
+        say "Backup ${C_B}$BK_ID${C_0} saved. Undo with: dot rollback $BK_ID"
+    elif [ -d "$BK_DIR" ]; then
+        rm -rf -- "$BK_DIR"
+    fi
+}
+bk_resolve() { # bk_resolve <id|latest> -> $RB_DIR
+    if [ -z "$1" ] || [ "$1" = latest ]; then
+        rb_last=$(cat "$STATE/backups/.latest" 2>/dev/null) || rb_last=''
+        if [ -z "$rb_last" ] ||
+            [ ! -f "$STATE/backups/$rb_last/manifest" ]; then
+            # backup ids are timestamps without odd characters
+            rb_last=$(ls -1 "$STATE/backups" 2>/dev/null |
+                LC_ALL=C sort | tail -n 1)
+        fi
+        [ -n "$rb_last" ] || die 'no backups yet'
+        RB_DIR=$STATE/backups/$rb_last
+    else
+        RB_DIR=$STATE/backups/$1
+    fi
+    [ -f "$RB_DIR/manifest" ] || die "no such backup: $1 (see: dot backups)"
+}
+# manifest_list <file> <replaced-label> <created-label>
+manifest_list() {
+    cut -f1,3 "$1" | sed -e "s/^M$TAB/    $2 /" -e "s/^C$TAB/    $3 /"
+}
+cmd_backups() {
+    for cb_a; do
+        common_flag "$cb_a" || die "backups: unknown option $cb_a"
+    done
+    info "Backups in $(pp "$STATE/backups")"
+    cb_any=0
+    for cb_d in "$STATE"/backups/*; do
+        [ -f "$cb_d/manifest" ] || continue
+        cb_any=1
+        cb_m=$(grep -c '^M' "$cb_d/manifest")
+        cb_c=$(grep -c '^C' "$cb_d/manifest")
+        say "  ${C_B}${cb_d##*/}${C_0}  $cb_m replaced, $cb_c created"
+        [ "$OPT_V" = 1 ] &&
+            manifest_list "$cb_d/manifest" 'replaced' 'created '
+    done
+    [ "$cb_any" = 1 ] || note 'none yet'
+    info "Snapshots in $(pp "$STATE/snapshots")"
+    snapshot_list
+    say "Undo with: dot rollback [id]     Restore a snapshot with:" \
+        "dot snapshot restore <id>"
+}
+cmd_rollback() {
+    rb_id=''
+    for rb_a; do
+        common_flag "$rb_a" || rb_id=$rb_a
+    done
+    bk_resolve "$rb_id"
+    rb_name=${RB_DIR##*/}
+    rb_m=$(grep -c '^M' "$RB_DIR/manifest")
+    rb_c=$(grep -c '^C' "$RB_DIR/manifest")
+    info "Rolling back $rb_name: restore $rb_m, remove $rb_c that it created"
+    [ "$OPT_V" = 1 ] && manifest_list "$RB_DIR/manifest" 'restore' 'remove '
+    if [ "$OPT_DRY" = 1 ]; then
+        note 'dry run: nothing changed'
+        return 0
+    fi
+    if ! confirm 'Go ahead? (the current state is backed up first)' y; then
+        say 'Nothing changed.'
+        return 0
+    fi
+    lock
+    bk_begin "undo-$rb_name"
+    awk '{ a[NR] = $0 } END { for (i = NR; i > 0; i--) print a[i] }' \
+        "$RB_DIR/manifest" >"$TMP/rb"
+    while IFS=$TAB read -r rb_k rb_n rb_p; do
+        if exists "$rb_p"; then
+            bk_modify "$rb_p" || continue
+            rm -rf -- "$rb_p"
+        elif [ "$rb_k" = M ]; then
+            bk_create "$rb_p"
+        fi
+        if [ "$rb_k" = M ]; then
+            mkdir -p -- "${rb_p%/*}"
+            cp -RPp -- "$RB_DIR/files/$rb_n" "$rb_p" &&
+                ok "restored $(pp "$rb_p")"
+        else
+            note "removed $(pp "$rb_p")"
+        fi
+    done <"$TMP/rb"
+    bk_end
+    say 'Time travel complete. Changed your mind again?' \
+        'Run dot rollback once more.'
+}
+
+snapshot_any() {
+    for sa_f in "$STATE"/snapshots/*.tar*; do
+        [ -f "$sa_f" ] && return 0
+    done
+    return 1
+}
+snapshot_list() {
+    sl_any=0
+    for sl_f in "$STATE"/snapshots/*.tar*; do
+        [ -f "$sl_f" ] || continue
+        sl_any=1
+        sl_s=$(wc -c <"$sl_f")
+        sl_id=${sl_f##*/}
+        say "  ${C_B}${sl_id%%.tar*}${C_0}  $((sl_s / 1024)) KiB"
+    done
+    [ "$sl_any" = 1 ] || note 'none yet'
+}
+snapshot_create() {
+    [ -d "$TARGET" ] || return 0
+    sc_f=$STATE/snapshots/$(date +%Y%m%d-%H%M%S)-${1:-manual}.tar
+    (umask 077 && mkdir -p -- "$STATE/snapshots") ||
+        die 'cannot create the snapshot folder'
+    info "Snapshot of $(pp "$TARGET") (everything, stays on this machine)"
+    if command -v gzip >/dev/null 2>&1; then
+        (umask 077 && cd -P -- "$TARGET" &&
+            tar -cf - . 2>"$TMP/tar.err" | gzip -c >"$sc_f.gz.part") &&
+            mv -f -- "$sc_f.gz.part" "$sc_f.gz" && sc_f=$sc_f.gz
+    else
+        (umask 077 && cd -P -- "$TARGET" &&
+            tar -cf "$sc_f.part" . 2>"$TMP/tar.err") &&
+            mv -f -- "$sc_f.part" "$sc_f"
+    fi
+    [ -f "$sc_f" ] ||
+        die "snapshot failed: $(head -n 3 "$TMP/tar.err" 2>/dev/null)"
+    ok "$(pp "$sc_f")"
+}
+snapshot_restore() { # snapshot_restore <id>
+    [ -n "$1" ] ||
+        die 'usage: dot snapshot restore <id>  (see: dot snapshot list)'
+    sr_f=''
+    for sr_c in "$STATE/snapshots/$1".tar*; do
+        [ -f "$sr_c" ] && sr_f=$sr_c
+    done
+    [ -n "$sr_f" ] || die "no such snapshot: $1"
+    say "This extracts $1 over $(pp "$TARGET")." \
+        "Files that are not in the snapshot stay as they are."
+    [ "$OPT_DRY" = 1 ] && return 0
+    confirm 'Take a fresh snapshot first, then restore?' y || return 0
+    lock
+    snapshot_create before-restore
+    mkdir -p -- "$TARGET"
+    case $sr_f in
+    *.gz) gzip -dc -- "$sr_f" | (cd -P -- "$TARGET" && tar -xf -) ;;
+    *) (cd -P -- "$TARGET" && tar -xf -) <"$sr_f" ;;
+    esac && ok "restored $1"
+}
+cmd_snapshot() {
+    sn_sub=${1:-create}
+    [ $# -gt 0 ] && shift
+    case $sn_sub in
+    create | new)
+        for sn_a; do
+            common_flag "$sn_a" || die "snapshot: unknown option $sn_a"
+        done
+        if [ "$OPT_DRY" = 1 ]; then
+            note "would archive $(pp "$TARGET")"
+            return 0
+        fi
+        snapshot_create manual
+        ;;
+    list) snapshot_list ;;
+    restore)
+        sn_id=''
+        for sn_a; do common_flag "$sn_a" || sn_id=$sn_a; done
+        snapshot_restore "$sn_id"
+        ;;
+    *) die 'usage: dot snapshot [create|list|restore <id>]' ;;
+    esac
+}
+
+# ------------------------------------------------------------ git and GitHub
+
+gitignore_ensure() {
+    gi_f=$DOT_ROOT/.gitignore
+    if [ -f "$gi_f" ] && grep -q 'dot safety net' "$gi_f"; then return 0; fi
+    {
+        printf '%s\n' '# --- dot safety net: never commit secrets' \
+            '# (kept by dot; add your own rules below) ---'
+        printf '%s\n' 'id_rsa*' 'id_dsa*' 'id_ecdsa*' 'id_ed25519*' \
+            '*.pem' '*.key' '*.p12' '*.pfx' '*.kdbx' '.netrc' \
+            '.git-credentials' '*credential*' '*secret*' '*token*' \
+            '.env' '.env.*' 'rclone.conf' 'hosts.yml*' 'known_hosts*' \
+            'authorized_keys' '*.sqlite*' '*.db' '*.db-*' '*history*' \
+            '.DS_Store' '._*' '*.icloud' '*.local' '*.swp' '.dot-tmp.*'
+        printf '%s\n' '# --- end dot safety net ---'
+    } >>"$gi_f"
+}
+hooks_install() {
+    [ -n "$(g config --get core.hooksPath 2>/dev/null)" ] && return 0
+    hi_d=$(g rev-parse --git-path hooks 2>/dev/null) || return 0
+    case $hi_d in /*) ;; *) hi_d=$DOT_ROOT/$hi_d ;; esac
+    hi_f=$hi_d/pre-commit
+    if [ -f "$hi_f" ]; then
+        grep -q 'hook pre-commit' "$hi_f" 2>/dev/null ||
+            vrb 'a pre-commit hook exists; add this line to it:' \
+                'sh "$(git rev-parse --show-toplevel)/dot" hook pre-commit'
+        return 0
+    fi
+    mkdir -p -- "$hi_d" 2>/dev/null || return 0
+    cat >"$hi_f" <<'EOF'
+#!/bin/sh
+# Installed by dot: refuse commits that contain secrets.
+# Skip once (only if you are sure) with: git commit --no-verify
+exec sh "$(git rev-parse --show-toplevel)/dot" hook pre-commit
+EOF
+    chmod +x "$hi_f" 2>/dev/null
+}
+# repo_rel <path-in-repo>: the ~/.config-relative path, or empty
+repo_rel() {
+    case $1 in
+    config/*) printf '%s' "${1#config/}" ;;
+    overlay/*/*) printf '%s' "${1#overlay/*/}" ;;
+    esac
+}
+cmd_hook() {
+    [ "${1:-}" = pre-commit ] || die 'usage: dot hook pre-commit'
+    require_repo
+    load_rules
+    g -c core.quotePath=false diff --cached --name-only \
+        --diff-filter=ACMR >"$TMP/staged"
+    hk_bad=0
+    while IFS= read -r hk_f; do
+        case $hk_f in secrets/*)
+            # must be one of dot's encrypted formats, never plain text
+            g show ":$hk_f" >"$TMP/blob" 2>/dev/null || continue
+            if [ "$(secret_kind "$TMP/blob")" = none ]; then
+                bad "$hk_f  (not encrypted)"
+                hk_bad=1
+            fi
+            continue
+            ;;
+        esac
+        hk_rel=$(repo_rel "$hk_f")
+        if [ -n "$hk_rel" ] && ignored "$hk_rel"; then
+            bad "$hk_f  (matches rule '$RM_PAT')"
+            hk_bad=1
+            continue
+        fi
+        g show ":$hk_f" >"$TMP/blob" 2>/dev/null || continue
+        if secret_scan "$TMP/blob"; then
+            bad "$hk_f  ($SCAN_HIT)"
+            hk_bad=1
+        fi
+    done <"$TMP/staged"
+    if [ "$hk_bad" = 1 ]; then
+        printf '%s\n' \
+            "dot refused this commit: the files above look like secrets." \
+            "  Unstage:          git rm --cached <file>" \
+            "  False positive:   end the line with a 'dot:allow' comment," \
+            "                    or: dot allow <pattern>" >&2
+        exit 1
+    fi
+    return 0
+}
+
+url_owner() {
+    printf '%s\n' "$1" | sed -e 's#\.git$##' -e 's#/*$##' \
+        -e 's#^.*[:/]\([^/:]*\)/[^/:]*$#\1#'
+}
+gh_ready() { command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+git_upstream_ok() {
+    g rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1
+}
+git_branch() { g symbolic-ref -q --short HEAD 2>/dev/null || printf 'main'; }
+has_origin() { g config --get remote.origin.url >/dev/null 2>&1; }
+git_push() {
+    has_origin || { note 'no GitHub remote yet: run dot init' && return 0; }
+    if git_upstream_ok; then
+        g push -q
+    else
+        g push -q -u origin "$(git_branch)"
+    fi && ok "pushed to $(g config --get remote.origin.url)"
+}
+git_pull() {
+    has_origin || { note 'no remote yet' && return 0; }
+    gp_err="pull failed: fix it in $(pp "$DOT_ROOT") (dot git status),"
+    gp_err="$gp_err then retry"
+    if git_upstream_ok; then
+        g pull -q --rebase --autostash || die "$gp_err"
+    elif g ls-remote --exit-code --heads origin "$(git_branch)" \
+        >/dev/null 2>&1; then
+        g pull -q --rebase --autostash origin "$(git_branch)" ||
+            die "$gp_err"
+    fi
+}
+
+# gh_pick_account: let someone with several gh accounts choose -> $rs_me
+gh_pick_account() {
+    gh auth status 2>&1 | sed -n 's/.*account \([^ ]*\).*/\1/p' |
+        awk '!s[$0]++' >"$TMP/accounts"
+    rs_me=$(gh api user --jq .login 2>/dev/null) || rs_me=''
+    [ "$(count "$TMP/accounts")" -gt 1 ] && [ "$HAVE_TTY" = 1 ] || return 0
+    say 'GitHub accounts on this machine:'
+    awk '{ print "  " NR ") " $0 }' "$TMP/accounts"
+    ask 'Which account should own this repo? (name)' "$rs_me"
+    if [ "$REPLY" != "$rs_me" ] && grep -q -x -F "$REPLY" "$TMP/accounts"
+    then
+        gh auth switch -u "$REPLY" >/dev/null 2>&1 && rs_me=$REPLY
+    fi
+}
+# remote_setup: make sure "origin" is a repo the current user owns
+remote_setup() {
+    rs_me=''
+    if command -v gh >/dev/null 2>&1; then
+        if ! gh_ready && [ "$HAVE_TTY" = 1 ] &&
+            confirm 'Log in to GitHub with gh now?' y; then
+            gh auth login </dev/tty || warn 'gh login did not finish'
+        fi
+        gh_ready && gh_pick_account
+    fi
+    if [ -z "$rs_me" ]; then
+        ask 'Your GitHub username (empty to stay local):' ''
+        rs_me=$REPLY
+    fi
+    if [ -z "$rs_me" ]; then
+        note 'repo stays local; run dot init again any time'
+        return 0
+    fi
+    rs_origin=$(g config --get remote.origin.url 2>/dev/null) || rs_origin=''
+    if [ -n "$rs_origin" ]; then
+        rs_owner=$(url_owner "$rs_origin")
+        if [ "$(lower "$rs_owner")" = "$(lower "$rs_me")" ]; then
+            ok "origin is yours: $rs_origin"
+            return 0
+        fi
+        say "This repo came from ${C_B}$rs_owner${C_0}." \
+            "To save your own version, dot can create it under"
+        say "${C_B}$rs_me${C_0} and keep $rs_owner's as 'upstream'" \
+            "(dot upstream merges their updates)."
+        confirm "Make your own copy under $rs_me?" y || return 0
+        if g config --get remote.upstream.url >/dev/null 2>&1; then
+            g remote set-url upstream "$rs_origin" && g remote remove origin
+        else
+            g remote rename origin upstream
+        fi
+    fi
+    ask 'Repository name:' "${DOT_ROOT##*/}"
+    rs_name=$REPLY
+    if gh_ready; then
+        remote_create_gh
+    else
+        remote_add_manual
+    fi
+}
+remote_create_gh() {
+    if gh repo view "$rs_me/$rs_name" >/dev/null 2>&1; then
+        g remote add origin "https://github.com/$rs_me/$rs_name.git"
+        ok "using your existing github.com/$rs_me/$rs_name"
+        return 0
+    fi
+    ask "Visibility: [p]rivate or p[u]blic?" p
+    case $REPLY in u | U | public) rs_vis=public ;; *) rs_vis=private ;; esac
+    confirm "Create github.com/$rs_me/$rs_name ($rs_vis)?" \
+        "$(tty_default)" || return 0
+    gh repo create "$rs_me/$rs_name" "--$rs_vis" --source "$DOT_ROOT" \
+        --remote origin >/dev/null || die 'gh repo create failed'
+    ok "created github.com/$rs_me/$rs_name ($rs_vis)"
+}
+remote_add_manual() {
+    rm_proto=h
+    for rm_k in "$HOME"/.ssh/id_*; do
+        [ -f "$rm_k" ] && rm_proto=s && break
+    done
+    ask 'Connect with [s]sh or [h]ttps?' "$rm_proto"
+    case $REPLY in
+    s | S | ssh) rm_url=git@github.com:$rs_me/$rs_name.git ;;
+    *) rm_url=https://github.com/$rs_me/$rs_name.git ;;
+    esac
+    say "Create an EMPTY repository named '$rs_name' at" \
+        "https://github.com/new (no README, no license)."
+    ask 'Press Enter when it exists...' ''
+    g remote add origin "$rm_url"
+    ok "origin -> $rm_url"
+}
+cli_link_offer() {
+    cl_bin=$HOME/.local/bin
+    [ -e "$cl_bin/dot" ] && return 0
+    command -v dot >/dev/null 2>&1 && return 0
+    confirm "Install the 'dot' command into $(pp "$cl_bin")?" y || return 0
+    mkdir -p -- "$cl_bin" && ln -s -- "$DOT_ROOT/dot" "$cl_bin/dot" &&
+        ok "$(pp "$cl_bin/dot") -> $(pp "$DOT_ROOT/dot")"
+    case :$PATH: in
+    *":$cl_bin:"*) ;;
+    *) note "add it to PATH:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+}
+cmd_init() {
+    for in_a; do common_flag "$in_a" || die "init: unknown option $in_a"; done
+    if [ -z "$DOT_ROOT" ] && in_d=$(self_dir 2>/dev/null) &&
+        [ -f "$in_d/dot" ]; then
+        DOT_ROOT=$in_d
+        mkdir -p -- "$DOT_ROOT/config"
+    fi
+    require_repo
+    need git
+    if [ ! -d "$DOT_ROOT/.git" ]; then
+        g init -q && g symbolic-ref HEAD refs/heads/main &&
+            ok "git repo created in $(pp "$DOT_ROOT")"
+        hooks_install
+    fi
+    if [ -z "$(g config user.email 2>/dev/null)" ]; then
+        ask 'Name for your commits:' "$(id -un 2>/dev/null)"
+        g config user.name "$REPLY"
+        ask 'Email for your commits' \
+            '(a GitHub noreply address keeps yours private):' ''
+        [ -n "$REPLY" ] && g config user.email "$REPLY"
+    fi
+    mkdir -p -- "$DOT_ROOT/config"
+    gitignore_ensure
+    ok 'secret guard: rules + content scan + .gitignore + pre-commit hook'
+    remote_setup
+    cli_link_offer
+    if ! g rev-parse -q --verify HEAD >/dev/null 2>&1 ||
+        [ -n "$(g status --porcelain 2>/dev/null)" ]; then
+        if [ -d "$TARGET" ] && confirm "Capture $(pp "$TARGET") now?" y; then
+            cmd_capture
+        fi
+    fi
+    if has_origin && g rev-parse -q --verify HEAD >/dev/null 2>&1; then
+        confirm 'Push to GitHub now?' "$(tty_default)" && git_push
+    fi
+    say "Ready. Day to day: ${C_B}dot sync${C_0}." \
+        "New machine: ${C_B}dot bootstrap <you>${C_0}."
+}
+cmd_sync() {
+    require_repo
+    need git
+    lock
+    cs_head=$(g rev-parse -q --verify HEAD 2>/dev/null) || cs_head=''
+    cmd_capture "$@"
+    [ "$OPT_DRY" = 1 ] && return 0
+    cs_before=$(g rev-parse -q --verify HEAD 2>/dev/null) || cs_before=''
+    git_pull
+    cs_after=$(g rev-parse -q --verify HEAD 2>/dev/null) || cs_after=''
+    git_push
+    if [ -n "$cs_before" ] && [ "$cs_before" != "$cs_after" ] &&
+        [ -n "$cs_head" ]; then
+        say "Changes from your other machines arrived."
+        if confirm 'Apply them to this machine now?' y; then
+            if [ "$CAP_SECRETS" = 1 ]; then
+                cmd_apply --secrets
+            else
+                cmd_apply
+            fi
+        else
+            note 'apply later with: dot apply'
+        fi
+    fi
+}
+cmd_push() {
+    for pu_a; do common_flag "$pu_a" || die "push: unknown option $pu_a"; done
+    require_repo
+    need git
+    git_push
+}
+cmd_pull() {
+    require_repo
+    need git
+    lock
+    git_pull
+    cmd_apply "$@"
+}
+cmd_upstream() {
+    require_repo
+    need git
+    g config --get remote.upstream.url >/dev/null 2>&1 ||
+        die "no 'upstream' remote (it is set when 'dot init' gives you" \
+            "your own copy of someone's repo)"
+    lock
+    g fetch -q upstream || die 'fetch from upstream failed'
+    up_b=''
+    for up_c in main master; do
+        if g rev-parse -q --verify "upstream/$up_c" >/dev/null 2>&1; then
+            up_b=$up_c
+            break
+        fi
+    done
+    [ -n "$up_b" ] || die 'upstream has no main or master branch'
+    if g merge --no-edit -q "upstream/$up_b"; then
+        ok "merged upstream/$up_b. Use it with: dot apply"
+    else
+        die "merge conflicts: fix them in $(pp "$DOT_ROOT")," \
+            "then: dot git commit"
+    fi
+}
+cmd_bootstrap() {
+    bs_src='' bs_dir=''
+    while [ $# -gt 0 ]; do
+        case $1 in
+        -*) common_flag "$1" || die "bootstrap: unknown option $1" ;;
+        *) if [ -z "$bs_src" ]; then bs_src=$1; else bs_dir=$1; fi ;;
+        esac
+        shift
+    done
+    [ -n "$bs_src" ] ||
+        die 'usage: dot bootstrap <github-user | user/repo | git-url> [folder]'
+    case $bs_src in
+    *://* | git@* | /* | ./* | ../*) bs_url=$bs_src ;;
+    */*) bs_url=https://github.com/$bs_src.git ;;
+    *) bs_url=https://github.com/$bs_src/dotfiles.git ;;
+    esac
+    need git
+    if [ "$OPT_DRY" = 1 ]; then
+        bs_dir=$TMP/repo
+    elif [ -z "$bs_dir" ]; then
+        ask 'Where should the dotfiles repo live?' "${DOT_DIR:-$HOME/dotfiles}"
+        bs_dir=$REPLY
+    fi
+    case $bs_dir in "~"/*) bs_dir=$HOME/${bs_dir#"~/"} ;; esac
+    if [ -d "$bs_dir/.git" ]; then
+        ok "already cloned: $(pp "$bs_dir")"
+        git -C "$bs_dir" pull -q --ff-only ||
+            warn 'could not update it; using what is there'
+    else
+        info "Cloning $bs_url"
+        git clone -q -- "$bs_url" "$bs_dir" || die "clone failed: $bs_url"
+    fi
+    is_repo "$bs_dir" || die "$bs_url is not a dot repo (no 'dot' script)"
+    if [ -d "$bs_dir/hooks" ] && [ "${DOT_NO_HOOKS:-0}" != 1 ] &&
+        [ -n "$(ls -A "$bs_dir/hooks" 2>/dev/null)" ]; then
+        say "This repo has hooks (scripts that run during apply):" \
+            "$(ls "$bs_dir/hooks" | paste -s -d' ' -)"
+        confirm 'Allow them to run? (read them first if this repo is not' \
+            'yours)' n || DOT_NO_HOOKS=1
+    fi
+    export DOT_DIR="$bs_dir" DOT_YES="$OPT_YES" DOT_DRY_RUN="$OPT_DRY"
+    export DOT_VERBOSE="$OPT_V" DOT_NO_HOOKS="${DOT_NO_HOOKS:-0}"
+    # stdin may be the script itself (curl | sh): keep children away from it
+    sh "$bs_dir/dot" apply </dev/null || exit 1
+    [ "$OPT_DRY" = 1 ] && exit 0
+    cleanup
+    exec sh "$bs_dir/dot" init </dev/null
+}
+
+# ---------------------------------------------------------------- inspection
+
+status_repo() {
+    st_repo=$(pp "$DOT_ROOT")
+    if ! is_git; then
+        say "  repo     $st_repo  (not a git repo yet: dot init)"
+        return 0
+    fi
+    st_b=$(git_branch)
+    st_o=$(g config --get remote.origin.url 2>/dev/null) ||
+        st_o='no remote (dot init)'
+    st_d=$(g status --porcelain 2>/dev/null | wc -l)
+    st_d=$((st_d))
+    st_ab=''
+    if git_upstream_ok; then
+        st_c=$(g rev-list --left-right --count 'HEAD...@{u}' 2>/dev/null) ||
+            st_c=''
+        set -- $st_c
+        [ $# -eq 2 ] && st_ab=", $1 ahead, $2 behind (as of last fetch)"
+    fi
+    [ "$st_d" -gt 0 ] && st_ab="$st_ab, $st_d uncommitted"
+    say "  repo     $st_repo  ($st_b -> $st_o$st_ab)"
+}
+status_links() {
+    [ -f "$DOT_ROOT/dot.links" ] || return 0
+    st_ok=0 st_miss=0
+    strip_comments "$DOT_ROOT/dot.links" >"$TMP/links"
+    while read -r st_n st_t2 st_rest; do
+        link_opts $st_rest
+        cond_ok "$LO_COND" || continue
+        if loads_target "$st_n" "${st_t2%/}"; then
+            st_ok=$((st_ok + 1))
+        else
+            st_miss=$((st_miss + 1))
+            vrb "~/$st_n is not linked"
+        fi
+    done <"$TMP/links"
+    say "${C_B}Links${C_0}: $st_ok ok, $st_miss not linked"
+}
+cmd_status() {
+    for st_a; do
+        common_flag "$st_a" || die "status: unknown option $st_a"
+    done
+    require_repo
+    load_rules
+    say "${C_B}dot $DOT_VERSION${C_0}"
+    status_repo
+    st_t=$(canon "$TARGET")
+    if [ "$st_t" != "$TARGET" ]; then
+        say "  config   $(pp "$TARGET") -> $(pp "$st_t")"
+    else
+        say "  config   $(pp "$TARGET")"
+    fi
+    say "  machine  $OS${DISTRO:+/$DISTRO}, host $HOST"
+    if [ -d "$TARGET" ]; then
+        capture_analyze
+        say "${C_B}Capture${C_0} (machine -> repo):" \
+            "$(count "$TMP/cap.new") new, $(count "$TMP/cap.mod") changed," \
+            "$(count "$TMP/cap.same") unchanged; kept out:" \
+            "$(count "$TMP/cap.secret") with secrets," \
+            "$(count "$TMP/cap.rule") by rules"
+        while IFS=$TAB read -r st_k st_rel st_x st_y; do
+            ok "$st_rel"
+        done <"$TMP/cap.new"
+        while IFS=$TAB read -r st_k st_rel st_x st_y; do
+            chg "$st_rel"
+        done <"$TMP/cap.mod"
+        while IFS=$TAB read -r st_rel st_why; do
+            bad "$st_rel  ($st_why)"
+        done <"$TMP/cap.secret"
+    fi
+    AP_MODE=${DOT_MODE:-copy}
+    apply_analyze
+    say "${C_B}Apply${C_0} (repo -> machine): $(count "$TMP/ap.new") new," \
+        "$(count "$TMP/ap.mod") differ"
+    status_links
+    st_tp=$(find "$DOT_ROOT/config" "$DOT_ROOT/overlay" -name '*.tmpl' \
+        2>/dev/null | wc -l)
+    [ $((st_tp)) -gt 0 ] && say "${C_B}Templates${C_0}: $((st_tp))" \
+        "(dot vars, dot render <path>)"
+    if [ -n "$SECRET_RELS" ]; then
+        st_sc=$(printf '%s\n' "$SECRET_RELS" | wc -l)
+        say "${C_B}Secrets${C_0}: $((st_sc)) in dot.secrets" \
+            "(capture/apply with --secrets; details: dot secret list)"
+    fi
+    return 0
+}
+cmd_diff() {
+    df_paths=''
+    for df_a; do common_flag "$df_a" || df_paths="$df_paths$df_a$NL"; done
+    require_repo
+    load_rules
+    AP_MODE=copy
+    apply_analyze
+    printf '%s' "$df_paths" >"$TMP/dfp"
+    df_any=0
+    while IFS=$TAB read -r df_rel df_src; do
+        if [ -n "$df_paths" ]; then
+            df_hit=0
+            while IFS= read -r df_p; do
+                df_p=${df_p#"$TARGET"/}
+                case $df_rel in "$df_p" | "$df_p"/*) df_hit=1 ;; esac
+            done <"$TMP/dfp"
+            [ "$df_hit" = 1 ] || continue
+        fi
+        df_any=1
+        say "${C_B}$df_rel${C_0}  (- this machine, + repo)"
+        diff -u -- "$TARGET/$df_rel" "$df_src" | sed '1,2d'
+    done <"$TMP/ap.mod"
+    [ "$df_any" = 1 ] || say 'No differences.'
+    return 0
+}
+# explain_one <rel>: say whether and why <rel> is backed up
+explain_one() {
+    ex_abs=$TARGET/$1
+    if [ -d "$ex_abs" ] && [ ! -L "$ex_abs" ]; then
+        if ignored "$1"; then
+            bad "$1/  kept out by rule '$RM_PAT'"
+        elif [ -e "$ex_abs/.git" ]; then
+            note "$1/  git clone: recorded in dot.plugins, not copied"
+        else
+            ok "$1/  folder is scanned file by file"
+        fi
+    elif [ -L "$ex_abs" ]; then
+        if ignored "$1"; then
+            bad "$1  kept out by rule '$RM_PAT'"
+        else
+            note "$1  symlink: kept as a link if it stays inside ~/.config"
+        fi
+    elif [ -f "$ex_abs" ]; then
+        classify "$1" "$ex_abs"
+        if [ "$CLS" = take ]; then
+            ok "$1  backed up ($WHY)"
+            ex_pv=$(privacy_scan "$ex_abs")
+            [ -n "$ex_pv" ] && note "contains: $ex_pv"
+        else
+            bad "$1  kept out: $WHY"
+        fi
+    elif ignored "$1"; then
+        bad "$1  would be kept out by rule '$RM_PAT'"
+    else
+        note "$1  does not exist (rules would not exclude it)"
+    fi
+}
+cmd_explain() {
+    [ $# -gt 0 ] || die 'usage: dot explain <path in ~/.config>'
+    load_rules
+    TARGET_REAL=$(canon "$TARGET")
+    for ex_p; do
+        case $ex_p in
+        "$TARGET"/*) ex_rel=${ex_p#"$TARGET"/} ;;
+        "$TARGET_REAL"/*) ex_rel=${ex_p#"$TARGET_REAL"/} ;;
+        /*) ex_rel=$(canon "$ex_p") && ex_rel=${ex_rel#"$TARGET_REAL"/} ;;
+        *) ex_rel=$ex_p ;;
+        esac
+        explain_one "${ex_rel%/}"
+    done
+}
+# scan_history: report secrets in any commit -> sets sc_found
+scan_history() {
+    info 'Scanning every commit in history'
+    g rev-list --all >"$TMP/revs"
+    while IFS= read -r sh_r; do
+        {
+            g grep -I -n -E -f "$PAT_CS" "$sh_r" --
+            g grep -I -n -i -E -f "$PAT_CI" "$sh_r" --
+        } 2>/dev/null | LC_ALL=C grep -v -E 'dot:allow|gitleaks:allow' |
+            cut -d: -f1-3
+    done <"$TMP/revs" | awk -F: '!s[$2 ":" $3]++' >"$TMP/hist"
+    while IFS=: read -r sh_c sh_f sh_l; do
+        bad "$sh_f line $sh_l  (in commit $(printf '%.10s' "$sh_c"))"
+        sc_found=1
+    done <"$TMP/hist"
+    [ -s "$TMP/hist" ] && note 'secrets in history stay public after' \
+        'deletion: rotate them, then rewrite history (git filter-repo)'
+    return 0
+}
+cmd_scan() {
+    sc_hist=0 sc_files=''
+    for sc_a; do
+        case $sc_a in
+        --history) sc_hist=1 ;;
+        -*) common_flag "$sc_a" || die "scan: unknown option $sc_a" ;;
+        *) sc_files="$sc_files$sc_a$NL" ;;
+        esac
+    done
+    load_rules
+    sc_found=0
+    : >"$TMP/scan.list"
+    if [ -n "$sc_files" ]; then
+        printf '%s' "$sc_files" | while IFS= read -r sc_p; do
+            if [ -d "$sc_p" ]; then
+                find "$sc_p" -name .git -prune -o -type f -print
+            else
+                printf '%s\n' "$sc_p"
+            fi
+        done >"$TMP/scan.list"
+        sc_base=''
+    else
+        require_repo
+        info "Scanning $(pp "$DOT_ROOT")"
+        if is_git; then
+            g -c core.quotePath=false ls-files --cached --others \
+                --exclude-standard >"$TMP/scan.list"
+        else
+            (cd "$DOT_ROOT" && find . -name .git -prune -o -type f -print |
+                sed 's#^\./##') >"$TMP/scan.list"
+        fi
+        sc_base=$DOT_ROOT/
+    fi
+    while IFS= read -r sc_f; do
+        sc_abs=$sc_base$sc_f
+        [ -f "$sc_abs" ] || continue
+        case $sc_base$sc_f in "$DOT_ROOT"/secrets/*)
+            if [ "$(secret_kind "$sc_abs")" = none ]; then
+                bad "$sc_f  (in secrets/ but not encrypted)"
+                sc_found=1
+            fi
+            continue
+            ;;
+        esac
+        sc_rel=$(repo_rel "$sc_f")
+        if [ -n "$sc_base" ] && [ -n "$sc_rel" ] && ignored "$sc_rel"; then
+            bad "$sc_f  (path matches rule '$RM_PAT')"
+            sc_found=1
+        fi
+        if secret_scan "$sc_abs"; then
+            bad "$sc_f  ($SCAN_HIT)"
+            sc_found=1
+        elif [ "$OPT_V" = 1 ]; then
+            sc_pv=$(privacy_scan "$sc_abs")
+            [ -n "$sc_pv" ] && note "$sc_f  contains: $sc_pv"
+        fi
+    done <"$TMP/scan.list"
+    if [ "$sc_hist" = 1 ] && [ -n "$sc_base" ] && is_git; then
+        scan_history
+    fi
+    if [ "$sc_found" = 1 ]; then return 1; fi
+    ok 'no secrets found'
+}
+
+dr_ok() { ok "$*"; }
+dr_no() { bad "$*" && dr_bad=1; }
+# doctor_config: check the config folder (broken links, iCloud stubs)
+doctor_config() {
+    if [ ! -d "$TARGET" ]; then
+        note "config: $(pp "$TARGET") does not exist yet" \
+            "(dot apply creates it)"
+        return 0
+    fi
+    dr_t=$(canon "$TARGET")
+    if [ "$dr_t" != "$TARGET" ]; then
+        dr_ok "config: $(pp "$TARGET") -> $(pp "$dr_t")"
+    else
+        dr_ok "config: $(pp "$TARGET")"
+    fi
+    find "$TARGET/" -type l 2>/dev/null >"$TMP/dl"
+    while IFS= read -r dr_l; do
+        [ -e "$dr_l" ] || dr_no "broken symlink: $(pp "$dr_l")"
+    done <"$TMP/dl"
+    dr_ic=$(find "$TARGET/" -name '*.icloud' 2>/dev/null | wc -l)
+    [ $((dr_ic)) -gt 0 ] && note "$((dr_ic)) file(s) not downloaded" \
+        "from iCloud yet (*.icloud); open them or run:" \
+        "brctl download <folder>"
+    return 0
+}
+# doctor_repo: check hooks, safety net, remote and the repo's contents
+doctor_repo() {
+    dr_h=$(g rev-parse --git-path hooks 2>/dev/null)/pre-commit
+    case $dr_h in /*) ;; *) dr_h=$DOT_ROOT/$dr_h ;; esac
+    if grep -q 'hook pre-commit' "$dr_h" 2>/dev/null; then
+        dr_ok 'pre-commit secret guard installed'
+    else
+        dr_no 'pre-commit secret guard missing (core.hooksPath set?)'
+    fi
+    if grep -q 'dot safety net' "$DOT_ROOT/.gitignore" 2>/dev/null; then
+        dr_ok '.gitignore safety net present'
+    else
+        dr_no '.gitignore safety net missing (dot init adds it)'
+    fi
+    if has_origin; then
+        dr_ok "origin: $(g config --get remote.origin.url)"
+    else
+        note 'no GitHub remote (dot init)'
+    fi
+    dr_dirty=$(g status --porcelain 2>/dev/null | wc -l)
+    [ $((dr_dirty)) -gt 0 ] &&
+        note "$((dr_dirty)) uncommitted change(s) in the repo"
+    load_rules
+    if [ -n "$SECRET_RELS" ]; then
+        dr_k=$(key_file)
+        if [ ! -f "$dr_k" ] && [ -z "${DOT_PASSPHRASE:-}" ]; then
+            note "secrets are listed but there is no key at $(pp "$dr_k")"
+        elif [ -f "$dr_k" ] &&
+            [ "$(ls -l "$dr_k" | cut -c5-10)" != '------' ]; then
+            dr_no "key is readable by others: chmod 600 $(pp "$dr_k")"
+        elif (crypt_ready) 2>/dev/null; then
+            dr_ok "secrets: key ready ($(crypt_backend))"
+        else
+            dr_no "secrets: $(crypt_backend) is not installed"
+        fi
+    fi
+    if (OPT_Q=1 cmd_scan >/dev/null 2>&1); then
+        dr_ok 'repo scan: no secrets'
+    else
+        dr_no 'repo scan found problems: run dot scan'
+    fi
+}
+cmd_doctor() {
+    for dr_a; do
+        common_flag "$dr_a" || die "doctor: unknown option $dr_a"
+    done
+    dr_bad=0
+    info "dot $DOT_VERSION doctor"
+    dr_sh=$(ps -p $$ -o comm= 2>/dev/null) || dr_sh=sh
+    note "shell: ${dr_sh##*/}; system: $OS${DISTRO:+/$DISTRO}; host: $HOST"
+    if [ -n "$DOT_ROOT" ]; then
+        dr_ok "repo: $(pp "$DOT_ROOT")"
+    else
+        dr_no 'not inside a dot repo (set DOT_DIR or run dot bootstrap)'
+    fi
+    if command -v git >/dev/null 2>&1; then
+        dr_ok "git: $(git --version | cut -d' ' -f3)"
+    else
+        dr_no "git missing: $(install_hint git)"
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        note 'gh: not installed (optional; makes dot init one step)'
+    elif gh_ready; then
+        dr_ok 'gh: logged in'
+    else
+        note 'gh: installed, not logged in (gh auth login)'
+    fi
+    doctor_config
+    if (mkdir -p -- "$STATE") 2>/dev/null && [ -w "$STATE" ]; then
+        dr_ok "state: $(pp "$STATE")"
+    else
+        dr_no "state folder not writable: $(pp "$STATE")"
+    fi
+    if [ -n "$DOT_ROOT" ] && is_git; then doctor_repo; fi
+    if [ -n "$DOT_ROOT" ] && [ -f "$DOT_ROOT/dot.links" ]; then
+        strip_comments "$DOT_ROOT/dot.links" >"$TMP/links"
+        while read -r dr_n dr_tg dr_rest; do
+            link_opts $dr_rest
+            cond_ok "$LO_COND" || continue
+            if [ -L "$HOME/$dr_n" ] && [ ! -e "$HOME/$dr_n" ]; then
+                dr_no "~/$dr_n is a broken link"
+            fi
+        done <"$TMP/links"
+    fi
+    case :$PATH: in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+        [ -e "$HOME/.local/bin/dot" ] && note '~/.local/bin is not on PATH'
+        ;;
+    esac
+    [ "$dr_bad" = 0 ] && say 'All good.'
+    return $dr_bad
+}
+
+# ------------------------------------------------------------------ packages
+
+sudo_cmd() {
+    if [ "$(id -u)" = 0 ]; then
+        printf ''
+    elif command -v sudo >/dev/null 2>&1; then
+        printf 'sudo'
+    elif command -v doas >/dev/null 2>&1; then
+        printf 'doas'
+    fi
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+packages_dump() {
+    if [ "$OPT_DRY" = 1 ]; then
+        note "would write package lists to $(pp "$pk_d")"
+        return 0
+    fi
+    mkdir -p -- "$pk_d"
+    if have brew && brew bundle dump --force --file="$pk_d/Brewfile" \
+        >/dev/null 2>&1; then
+        ok 'packages/Brewfile'
+    fi
+    if [ -f "$pk_pixi" ] && cp -- "$pk_pixi" "$pk_d/pixi-global.toml"; then
+        ok 'packages/pixi-global.toml'
+    fi
+    if [ -r /etc/apk/world ] &&
+        LC_ALL=C sort /etc/apk/world >"$pk_d/apk.txt"; then
+        ok 'packages/apk.txt'
+    fi
+    if have apt-mark; then
+        apt-mark showmanual 2>/dev/null | LC_ALL=C sort >"$pk_d/apt.txt" &&
+            ok 'packages/apt.txt'
+    fi
+    if have dnf; then
+        dnf repoquery --userinstalled --qf '%{name}\n' 2>/dev/null |
+            LC_ALL=C sort -u >"$pk_d/dnf.txt" && ok 'packages/dnf.txt'
+    fi
+    if have pacman && pacman -Qqe 2>/dev/null >"$pk_d/pacman.txt"; then
+        ok 'packages/pacman.txt'
+    fi
+    note 'commit with: dot sync'
+}
+packages_install() {
+    pk_s=$(sudo_cmd)
+    if [ -f "$pk_d/Brewfile" ] && have brew &&
+        confirm 'Install from packages/Brewfile?' y; then
+        [ "$OPT_DRY" = 1 ] || brew bundle --file="$pk_d/Brewfile"
+    fi
+    if [ -f "$pk_d/pixi-global.toml" ] && have pixi &&
+        confirm 'Install pixi global tools from packages/pixi-global.toml?' y
+    then
+        if [ "$OPT_DRY" != 1 ]; then
+            bk_begin packages
+            if [ -f "$pk_pixi" ]; then
+                bk_modify "$pk_pixi"
+            else
+                bk_create "$pk_pixi"
+            fi
+            mkdir -p -- "${pk_pixi%/*}" &&
+                cp -- "$pk_d/pixi-global.toml" "$pk_pixi" &&
+                pixi global sync
+            bk_end
+        fi
+    fi
+    if [ -f "$pk_d/apk.txt" ] && have apk &&
+        confirm 'Install packages/apk.txt with apk?' y; then
+        [ "$OPT_DRY" = 1 ] || $pk_s apk add $(cat "$pk_d/apk.txt")
+    fi
+    if [ -f "$pk_d/apt.txt" ] && have apt-get &&
+        confirm 'Install packages/apt.txt with apt?' y; then
+        [ "$OPT_DRY" = 1 ] ||
+            $pk_s apt-get install -y $(cat "$pk_d/apt.txt")
+    fi
+    if [ -f "$pk_d/dnf.txt" ] && have dnf &&
+        confirm 'Install packages/dnf.txt with dnf?' y; then
+        [ "$OPT_DRY" = 1 ] || $pk_s dnf install -y $(cat "$pk_d/dnf.txt")
+    fi
+    if [ -f "$pk_d/pacman.txt" ] && have pacman &&
+        confirm 'Install packages/pacman.txt with pacman?' y; then
+        [ "$OPT_DRY" = 1 ] ||
+            $pk_s pacman -S --needed --noconfirm $(cat "$pk_d/pacman.txt")
+    fi
+}
+cmd_packages() {
+    pk_sub=${1:-dump}
+    [ $# -gt 0 ] && shift
+    for pk_a; do
+        common_flag "$pk_a" || die "packages: unknown option $pk_a"
+    done
+    require_repo
+    pk_d=$DOT_ROOT/packages
+    pk_pixi=$HOME/.pixi/manifests/pixi-global.toml
+    case $pk_sub in
+    dump) packages_dump ;;
+    install) packages_install ;;
+    *) die 'usage: dot packages [dump|install]' ;;
+    esac
+}
+
+# ------------------------------------------------------------ small commands
+
+run_hook() {
+    rh_f=$DOT_ROOT/hooks/$1
+    [ -f "$rh_f" ] || return 0
+    if [ "${DOT_NO_HOOKS:-0}" = 1 ]; then
+        note "hooks disabled: skipped hooks/$1"
+        return 0
+    fi
+    if [ "$OPT_DRY" = 1 ]; then
+        note "would run hooks/$1"
+        return 0
+    fi
+    info "hooks/$1"
+    (
+        export DOT_ROOT DOT_TARGET="$TARGET" DOT_OS="$OS"
+        export DOT_DISTRO="$DISTRO" DOT_HOST="$HOST"
+        cd "$DOT_ROOT" && sh "$rh_f"
+    ) || warn "hooks/$1 failed"
+}
+ignore_file_add() { # ignore_file_add <line>
+    ia_f=$DOT_ROOT/dot.ignore
+    [ -f "$ia_f" ] || printf '%s\n' \
+        '# Extra rules for dot (built-in rules: dot rules). One glob a line.' \
+        '# name: any depth   dir/name: from the top of ~/.config' \
+        '# !pattern: always back up' >"$ia_f"
+    if grep -q -x -F -- "$1" "$ia_f"; then
+        note "already there: $1"
+        return 0
+    fi
+    printf '%s\n' "$1" >>"$ia_f"
+}
+cmd_ignore() {
+    [ $# -gt 0 ] || die 'usage: dot ignore <pattern>...'
+    require_repo
+    for ig_p; do ignore_file_add "$ig_p" && ok "ignoring $ig_p"; done
+}
+cmd_allow() {
+    [ $# -gt 0 ] || die 'usage: dot allow <pattern>...'
+    require_repo
+    for al_p; do
+        ignore_file_add "!${al_p#!}" && ok "allowing ${al_p#!}"
+    done
+    note 'path rules are bypassed for these;' \
+        'the secret scanner still checks their content'
+}
+cmd_rules() {
+    say "${C_B}Built-in rules${C_0} (never backed up):"
+    default_rules | rules_clean | paste -s -d' ' - | fold -s -w 78 |
+        sed 's/^/  /'
+    if [ -n "$DOT_ROOT" ] && [ -f "$DOT_ROOT/dot.ignore" ]; then
+        say "${C_B}Your rules${C_0} (dot.ignore):"
+        rules_clean <"$DOT_ROOT/dot.ignore" | sed 's/^/  /'
+    fi
+    say "${C_B}Secret patterns${C_0} (file content):"
+    {
+        secret_rules
+        secret_rules_ci
+    } | cut -f1 | paste -s -d, - | sed 's/,/, /g' | fold -s -w 78 |
+        sed 's/^/  /'
+}
+cmd_completion() {
+    cat <<'EOF'
+# dot tab completion for bash and zsh. Add to your shell rc:
+#   eval "$(dot completion)"
+if [ -n "${ZSH_VERSION:-}" ]; then
+    autoload -U +X bashcompinit && bashcompinit
+fi
+_dot_complete() {
+    _dot_cur=${COMP_WORDS[COMP_CWORD]}
+    _dot_w="status capture save sync diff bootstrap apply install pull push"
+    _dot_w="$_dot_w init upstream scan explain ignore allow rules backups"
+    _dot_w="$_dot_w rollback snapshot adopt link plugins packages doctor"
+    _dot_w="$_dot_w secret template render vars completion git path"
+    _dot_w="$_dot_w version help"
+    if [ "$COMP_CWORD" -gt 1 ]; then
+        case ${COMP_WORDS[1]} in
+        apply | install | pull)
+            _dot_w="--mode --link --copy --strategy --overwrite --keep"
+            _dot_w="$_dot_w --newer --review --no-links --no-plugins"
+            _dot_w="$_dot_w --snapshot --no-snapshot --secrets -n -y -v -q"
+            ;;
+        capture | save | sync)
+            _dot_w="--prune --no-commit --push --secrets -m -n -y -v -q"
+            ;;
+        secret | secrets) _dot_w="init add rm list --age --openssl" ;;
+        snapshot) _dot_w="create list restore" ;;
+        plugins) _dot_w="list install update" ;;
+        packages) _dot_w="dump install" ;;
+        scan) _dot_w="--history" ;;
+        *) _dot_w="" ;;
+        esac
+    fi
+    COMPREPLY=($(compgen -W "$_dot_w" -- "$_dot_cur"))
+    if [ "$COMP_CWORD" -gt 1 ]; then
+        COMPREPLY+=($(compgen -f -- "$_dot_cur"))
+    fi
+}
+complete -F _dot_complete dot
+EOF
+}
+cmd_git() {
+    require_repo
+    need git
+    cleanup
+    exec git -C "$DOT_ROOT" "$@"
+}
+
+usage() {
+    cat <<EOF
+${C_B}dot $DOT_VERSION${C_0} - your ~/.config in git, minus the secrets.
+
+${C_B}Usage:${C_0} dot [options] <command> [command options]
+
+${C_B}Everyday${C_0}
+  status                  what changed, what would be captured or applied
+  capture (save)          copy safe files from ~/.config into the repo, commit
+      --prune  --no-commit  --push  -m <message>
+  sync                    capture + pull + push, in one go
+  diff [path...]          differences between this machine and the repo
+
+${C_B}New or other machines${C_0}
+  bootstrap <user[/repo]|url> [dir]   clone a dot repo and apply it
+  apply (install)         put the repo's config into ~/.config, with backups
+      --mode copy|link    copy files (default) or symlink them to the repo
+      --strategy ask|overwrite|keep|newer
+                          (or --overwrite, --keep, --newer)
+      --no-links  --no-plugins  --snapshot  --no-snapshot
+  pull                    git pull, then apply
+  init                    set up git + your GitHub repo (handles forks)
+  upstream                merge updates from the repo you copied
+  push                    git push
+
+${C_B}Safety${C_0}
+  scan [--history] [path...]   look for secrets (the repo by default)
+  explain <path>          why a file is or is not backed up
+  ignore <pattern>        never back up matching paths
+  allow <pattern>         always back up matching paths (content still scanned)
+  rules                   show the built-in rules and secret patterns
+  backups                 list backups and snapshots
+  rollback [id]           undo an apply, adopt or link (latest by default)
+  snapshot [create|list|restore <id>]   full archive of ~/.config
+
+${C_B}Encrypted secrets${C_0} (opt-in: nothing happens without --secrets)
+  secret init [--age|--openssl]   make a key (kept outside the repo)
+  secret add <path>...    store these files encrypted in secrets/
+  secret rm <path>...     stop storing them
+  secret list             what is stored, and whether it is up to date
+  capture --secrets       also encrypt changed secrets
+  apply --secrets         also decrypt them into ~/.config
+
+${C_B}Templates${C_0} (<file>.tmpl in the repo becomes <file> on apply)
+  template <path>...      turn a captured file into a template
+  render <path>           print what a template becomes on this machine
+  vars                    the variables templates can use ({{host}}, ...)
+
+${C_B}Home folder${C_0}
+  adopt <~/.file>... [--as dir/file]   move into ~/.config, link back
+  link                    (re)create the home links listed in dot.links
+
+${C_B}Extras${C_0}
+  plugins [list|install|update]   git clones recorded instead of copied
+  packages [dump|install]         Brewfile, pixi global, apk, apt, dnf, pacman
+  doctor                  check the setup
+  completion              tab completion:  eval "\$(dot completion)"
+  git <args>              run git inside the repo
+  path                    print the repo folder:  cd "\$(dot path)"
+  version, help
+
+${C_B}Options${C_0}
+  -n, --dry-run   show what would happen     -y, --yes      assume yes
+  -v, --verbose   more detail                -q, --quiet    less output
+  -C <dir>        use this repo              --target <dir> not ~/.config
+  --no-color
+
+${C_B}Environment${C_0}: DOT_DIR DOT_TARGET DOT_STATE DOT_MODE DOT_STRATEGY
+DOT_MAX_SIZE DOT_NO_HOOKS DOT_SECRETS DOT_KEY DOT_PASSPHRASE NO_COLOR.
+Backups live in \$XDG_STATE_HOME/dot (never pushed).
+
+Not sure what a command will do? Add -n. Did it anyway? dot rollback.
+EOF
+}
+
+common_flag() {
+    case $1 in
+    -n | --dry-run) OPT_DRY=1 ;;
+    -y | --yes) OPT_YES=1 ;;
+    -v | --verbose) OPT_V=1 ;;
+    -q | --quiet) OPT_Q=1 ;;
+    *) return 1 ;;
+    esac
+}
+
+main() {
+    OPT_DRY=${DOT_DRY_RUN:-0} OPT_YES=${DOT_YES:-0} OPT_V=${DOT_VERBOSE:-0}
+    OPT_Q=0 OPT_COLOR=1 LOCKED=0 TMP='' RM_PAT='' SCAN_HIT=''
+    IGNORE_RULES='' ALLOW_RULES='' TARGET_REAL='' REPLY='' SECRET_RELS=''
+    CAP_SECRETS=${DOT_SECRETS:-0} AP_SECRETS=${DOT_SECRETS:-0}
+    AP_MODE=${DOT_MODE:-copy}
+    while [ $# -gt 0 ]; do
+        case $1 in
+        -C)
+            [ $# -ge 2 ] || die '-C needs a folder'
+            DOT_DIR=$2
+            shift
+            ;;
+        --target)
+            [ $# -ge 2 ] || die '--target needs a folder'
+            DOT_TARGET=$2
+            shift
+            ;;
+        --no-color) OPT_COLOR=0 ;;
+        -h | --help) set -- help && break ;;
+        -V | --version) set -- version && break ;;
+        --) shift && break ;;
+        -*) common_flag "$1" || die "unknown option $1 (see: dot help)" ;;
+        *) break ;;
+        esac
+        shift
+    done
+    color_init
+    tty_init
+    env_init
+    root_init
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    tmp_init
+    dm_cmd=${1:-}
+    [ $# -gt 0 ] && shift
+    if [ -z "$dm_cmd" ]; then
+        if [ -n "$DOT_ROOT" ]; then dm_cmd=status; else dm_cmd=help; fi
+    fi
+    case $dm_cmd in
+    status | st) cmd_status "$@" ;;
+    capture | save | backup) cmd_capture "$@" ;;
+    apply | install | restore) cmd_apply "$@" ;;
+    sync) cmd_sync "$@" ;;
+    diff) cmd_diff "$@" ;;
+    bootstrap | clone) cmd_bootstrap "$@" ;;
+    init | setup) cmd_init "$@" ;;
+    pull) cmd_pull "$@" ;;
+    push) cmd_push "$@" ;;
+    upstream) cmd_upstream "$@" ;;
+    scan) cmd_scan "$@" ;;
+    explain | why) cmd_explain "$@" ;;
+    ignore) cmd_ignore "$@" ;;
+    allow) cmd_allow "$@" ;;
+    rules) cmd_rules "$@" ;;
+    backups) cmd_backups "$@" ;;
+    rollback | undo) cmd_rollback "$@" ;;
+    snapshot) cmd_snapshot "$@" ;;
+    adopt) cmd_adopt "$@" ;;
+    link) cmd_link "$@" ;;
+    plugins) cmd_plugins "$@" ;;
+    packages | pkg) cmd_packages "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    completion | completions) cmd_completion ;;
+    secret | secrets) cmd_secret "$@" ;;
+    template | tmpl) cmd_template "$@" ;;
+    render) cmd_render "$@" ;;
+    vars) cmd_vars "$@" ;;
+    hook) cmd_hook "$@" ;;
+    git) cmd_git "$@" ;;
+    path)
+        require_repo
+        printf '%s\n' "$DOT_ROOT"
+        ;;
+    version) printf 'dot %s\n' "$DOT_VERSION" ;;
+    help) usage ;;
+    *) die "unknown command '$dm_cmd' (see: dot help)" ;;
+    esac
+}
+
+main "$@"

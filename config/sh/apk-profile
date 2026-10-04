@@ -1,0 +1,4 @@
+PS1='\e[36m\w\e[m: '
+alias ll='ls -al'
+alias la='ls -a'
+alias l='ls'
